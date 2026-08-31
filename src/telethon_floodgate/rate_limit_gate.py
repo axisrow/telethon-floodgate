@@ -1,4 +1,4 @@
-"""Proactive, per-account Telegram operation rate limiting.
+"""Proactive Telegram operation rate limiting: per-account and per-peer.
 
 The category values below are deliberately boring guardrails rather than a
 claim that Telegram publishes quotas (it does not).  They are calibrated to
@@ -8,6 +8,7 @@ so a new production sample can be applied without changing call sites.
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Callable
 
@@ -41,6 +42,18 @@ class TelegramRateLimitedError(RuntimeError):
         self.phone = phone
         self.category = category
         self.retry_after_sec = retry_after_sec
+
+
+class TelegramPeerRateLimitedError(TelegramRateLimitedError):
+    """Raised when a per-peer bucket defers an operation before the call.
+
+    A subclass so every existing ``TelegramRateLimitedError`` handler — "this
+    operation is unavailable right now, move on" — absorbs it unchanged.
+    """
+
+    def __init__(self, phone: str, peer: str, retry_after_sec: float) -> None:
+        super().__init__(phone, "send_peer", retry_after_sec)
+        self.peer = peer
 
 
 _OPERATION_CATEGORIES = {
@@ -120,11 +133,22 @@ class TelegramRateLimitGate:
     ADMIN_ACTION_SPEC = RateLimitSpec(max_calls=10, window_sec=60.0)
     SEND_SPEC = RateLimitSpec(max_calls=30, window_sec=60.0)
     CHANNEL_LIFECYCLE_SPEC = RateLimitSpec(max_calls=3, window_sec=300.0)
+    # Per-peer send limits (community-observed, not published by Telegram):
+    # roughly one message per second to the same private chat and about
+    # twenty per minute into the same group or channel. Applied as a second,
+    # INDEPENDENT bucket on top of the per-account ``send`` category — an
+    # account bursting into many different peers is still bounded by the
+    # category, while an account hammering one peer is stopped long before it.
+    SEND_PEER_USER_SPEC = RateLimitSpec(max_calls=1, window_sec=1.0)
+    SEND_PEER_CHANNEL_SPEC = RateLimitSpec(max_calls=20, window_sec=60.0)
+    SEND_PEER_CHAT_SPEC = RateLimitSpec(max_calls=20, window_sec=60.0)
 
     def __init__(
         self,
         *,
         category_limits: dict[str, RateLimitSpec] | None = None,
+        peer_limits: dict[str, RateLimitSpec] | None = None,
+        peer_max_buckets: int = 4096,
         time_func: Callable[[], float] | None = None,
     ) -> None:
         specs = {
@@ -147,15 +171,37 @@ class TelegramRateLimitGate:
             )
             for category, spec in specs.items()
         }
+        self._time_func = time_func
+        # Per-peer specs are keyed "<category>:<kind>" (e.g. "send:user"); the
+        # kind prefix comes from the peer key built by telethon_floodgate.peer.
+        # An unconfigured pair has no per-peer bucket, so passing a peer for it
+        # degrades to category-only limiting — the safe default.
+        self._peer_specs: dict[str, RateLimitSpec] = {
+            "send:user": self.SEND_PEER_USER_SPEC,
+            "send:channel": self.SEND_PEER_CHANNEL_SPEC,
+            "send:chat": self.SEND_PEER_CHAT_SPEC,
+        }
+        self._peer_specs.update(peer_limits or {})
+        self._peer_max_buckets = max(1, int(peer_max_buckets))
+        self._peer_buckets: OrderedDict[tuple[str, str, str], ResolveRateLimiter] = OrderedDict()
 
     @staticmethod
     def category_for(operation: str) -> str:
         # resolve is explicitly a no-op category: ResolveGuardMixin owns it.
         return _category_for_operation(operation)
 
-    def try_acquire(self, phone: str, category: str, *, slots: int = 1) -> float:
+    def try_acquire(
+        self, phone: str, category: str, *, slots: int = 1, peer: str | None = None
+    ) -> float:
         if category in {"resolve", "reaction"}:
             return 0.0
+        if peer is not None:
+            peer_retry_after = self._try_acquire_peer(phone, category, peer, slots)
+            if peer_retry_after > 0:
+                # The tighter per-peer bucket refused first and its slot for
+                # the broad category is left untouched, so a burst aimed at
+                # one peer cannot burn the account-wide budget.
+                return peer_retry_after
         return self._limiters.get(category, self._limiters["default"]).try_acquire_many(
             phone, slots
         )
@@ -164,3 +210,42 @@ class TelegramRateLimitGate:
         limiters = self._limiters.values() if category is None else [self._limiters[category]]
         for limiter in limiters:
             limiter.reset(phone)
+        if phone is None:
+            self._peer_buckets.clear()
+        else:
+            stale = [key for key in self._peer_buckets if key[0] == phone]
+            for key in stale:
+                del self._peer_buckets[key]
+
+    def _peer_spec_for(self, category: str, peer: str) -> RateLimitSpec | None:
+        kind = peer.split(":", 1)[0] if ":" in peer else ""
+        return self._peer_specs.get(f"{category}:{kind}")
+
+    def _try_acquire_peer(
+        self, phone: str, category: str, peer: str, slots: int
+    ) -> float:
+        """Reserve a slot in the (phone, category, peer) bucket.
+
+        Returns ``0.0`` when allowed (and records it) or the seconds to defer.
+        Buckets are created lazily and kept in LRU order, bounded by
+        ``peer_max_buckets``; eviction may briefly re-allow an idle peer — the
+        bound trades that for a hard cap on memory.
+        """
+        spec = self._peer_spec_for(category, peer)
+        if spec is None:
+            return 0.0
+        key = (phone, category, peer)
+        limiter = self._peer_buckets.get(key)
+        if limiter is None:
+            limiter = ResolveRateLimiter(
+                max_calls=spec.max_calls,
+                window_sec=spec.window_sec,
+                jitter_sec=spec.jitter_sec,
+                **({"time_func": self._time_func} if self._time_func is not None else {}),
+            )
+            self._peer_buckets[key] = limiter
+            while len(self._peer_buckets) > self._peer_max_buckets:
+                self._peer_buckets.popitem(last=False)
+        else:
+            self._peer_buckets.move_to_end(key)
+        return limiter.try_acquire_many(phone, slots)

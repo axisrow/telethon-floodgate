@@ -53,6 +53,43 @@ gate = TelegramRateLimitGate(
 project those paths have dedicated limiters (see `ResolveRateLimiter`, also
 shipped here).
 
+### Per-peer send limits
+
+Telegram throttles *sending* per peer, not just per account: roughly one
+message per second to the same private chat and about twenty per minute into
+the same group or channel. Pass a peer key to `try_acquire` and the gate
+checks a second, independent `(phone, category, peer)` bucket before the
+category one:
+
+```python
+from telethon_floodgate import peer_key
+
+retry_after = gate.try_acquire(phone, "send", peer=peer_key(entity))
+if retry_after > 0:
+    raise TelegramPeerRateLimitedError(phone, peer_key(entity), retry_after)
+```
+
+- A per-peer refusal does **not** consume the account-wide category slot, so a
+  burst aimed at one peer cannot burn the account budget.
+- `peer_key()` derives `"user:123"` / `"channel:-100123"` / `"chat:-456"` /
+  `"username:durov"` / `"id:123"` from ints, strings, Telethon TL peers, input
+  peers and full entities — purely local attribute access, never a network
+  round-trip.
+- Only `send:user`, `send:channel` and `send:chat` are configured by default;
+  unknown kinds pass through unthrottled. Override or disable via `peer_limits`
+  (a `"send:user"` entry with a permissive spec effectively turns it off) and
+  cap memory with `peer_max_buckets` (LRU, default 4096).
+
+```python
+gate = TelegramRateLimitGate(
+    peer_limits={"send:user": RateLimitSpec(max_calls=1, window_sec=5.0)},
+    peer_max_buckets=4096,
+)
+```
+
+`TelegramPeerRateLimitedError` subclasses `TelegramRateLimitedError`, so one
+"operation unavailable, move on" handler covers every layer.
+
 ### 2. Reactive circuit breaker — when Telegram answers anyway
 
 ```python

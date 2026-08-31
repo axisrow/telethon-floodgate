@@ -4,6 +4,8 @@ import pytest
 
 from telethon_floodgate.rate_limit_gate import (
     RateLimitSpec,
+    TelegramPeerRateLimitedError,
+    TelegramRateLimitedError,
     TelegramRateLimitGate,
 )
 
@@ -14,6 +16,7 @@ class _Clock:
 
     def __call__(self) -> float:
         return self.now
+
 
 def test_dialogs_gate_is_per_phone_and_conservative() -> None:
     clock = _Clock()
@@ -104,4 +107,114 @@ def test_compound_slot_reservation_is_atomic() -> None:
     assert gate.try_acquire("+1", "channel_lifecycle", slots=2) == 300.0
     # The rejected two-slot reservation must not consume the one remaining slot.
     assert gate.try_acquire("+1", "channel_lifecycle") == 0.0
+
+
+# --- per-peer send limits --------------------------------------------------
+
+
+def test_peer_user_bucket_allows_one_per_second() -> None:
+    clock = _Clock()
+    gate = TelegramRateLimitGate(time_func=clock)
+
+    assert gate.try_acquire("+1", "send", peer="user:42") == 0.0
+    assert gate.try_acquire("+1", "send", peer="user:42") > 0.0
+    # The 1s window slides: after a second the same peer is allowed again.
+    clock.now += 1.0
+    assert gate.try_acquire("+1", "send", peer="user:42") == 0.0
+
+
+def test_peer_refusal_does_not_burn_the_category_slot() -> None:
+    clock = _Clock()
+    gate = TelegramRateLimitGate(
+        category_limits={"send": RateLimitSpec(max_calls=2, window_sec=60)},
+        time_func=clock,
+    )
+
+    # A successful call consumes BOTH its peer slot and one category slot.
+    assert gate.try_acquire("+1", "send", peer="user:42") == 0.0
+    # The refused call burns neither: the peer bucket rejects it first and the
+    # account-wide category keeps its remaining slot.
+    assert gate.try_acquire("+1", "send", peer="user:42") > 0.0
+    assert gate.try_acquire("+1", "send") == 0.0
+    # The peer bucket passes for a fresh peer, but the category is now full:
+    # deferral with a retry hint, not a silent pass.
+    assert gate.try_acquire("+1", "send", peer="user:43") > 0.0
+
+
+def test_peer_channel_bucket_allows_twenty_per_minute() -> None:
+    clock = _Clock()
+    gate = TelegramRateLimitGate(time_func=clock)
+
+    for _ in range(20):
+        assert gate.try_acquire("+1", "send", peer="channel:-100123") == 0.0
+    assert gate.try_acquire("+1", "send", peer="channel:-100123") > 0.0
+    # A classic chat has the same shape of limit, in its own bucket.
+    assert gate.try_acquire("+1", "send", peer="chat:7") == 0.0
+
+
+def test_peer_buckets_are_per_phone() -> None:
+    clock = _Clock()
+    gate = TelegramRateLimitGate(time_func=clock)
+
+    assert gate.try_acquire("+1", "send", peer="user:42") == 0.0
+    assert gate.try_acquire("+1", "send", peer="user:42") > 0.0
+    assert gate.try_acquire("+2", "send", peer="user:42") == 0.0
+
+
+def test_unknown_peer_kind_is_not_limited() -> None:
+    """``send:unknown`` has no peer bucket — only the category still applies."""
+    clock = _Clock()
+    gate = TelegramRateLimitGate(
+        category_limits={"send": RateLimitSpec(max_calls=1000, window_sec=60)},
+        time_func=clock,
+    )
+
+    for _ in range(50):
+        assert gate.try_acquire("+1", "send", peer="id:999") == 0.0
+
+
+def test_peer_limits_are_configurable() -> None:
+    clock = _Clock()
+    gate = TelegramRateLimitGate(
+        peer_limits={"send:user": RateLimitSpec(max_calls=5, window_sec=60)},
+        time_func=clock,
+    )
+
+    for _ in range(5):
+        assert gate.try_acquire("+1", "send", peer="user:42") == 0.0
+    assert gate.try_acquire("+1", "send", peer="user:42") > 0.0
+
+
+def test_peer_buckets_are_bounded_by_lru_eviction() -> None:
+    clock = _Clock()
+    gate = TelegramRateLimitGate(peer_max_buckets=2, time_func=clock)
+
+    assert gate.try_acquire("+1", "send", peer="user:1") == 0.0
+    assert gate.try_acquire("+1", "send", peer="user:2") == 0.0
+    assert gate.try_acquire("+1", "send", peer="user:3") == 0.0  # evicts user:1
+    assert gate.try_acquire("+1", "send", peer="user:1") == 0.0  # fresh bucket
+    assert gate.try_acquire("+1", "send", peer="user:3") > 0.0  # survivor stays limited
+
+
+def test_reset_clears_peer_buckets_for_one_phone() -> None:
+    clock = _Clock()
+    gate = TelegramRateLimitGate(time_func=clock)
+
+    gate.try_acquire("+1", "send", peer="user:42")
+    gate.try_acquire("+2", "send", peer="user:42")
+    gate.reset("+1")
+    assert gate.try_acquire("+1", "send", peer="user:42") == 0.0
+    assert gate.try_acquire("+2", "send", peer="user:42") > 0.0
+    gate.reset()
+    assert gate.try_acquire("+2", "send", peer="user:42") == 0.0
+
+
+def test_peer_error_is_a_rate_limit_error() -> None:
+    """Existing TelegramRateLimitedError handlers must absorb the peer flavour."""
+    exc = TelegramPeerRateLimitedError("+7", "user:42", 3.5)
+
+    assert isinstance(exc, TelegramRateLimitedError)
+    assert exc.peer == "user:42"
+    assert exc.category == "send_peer"
+    assert exc.retry_after_sec == 3.5
 

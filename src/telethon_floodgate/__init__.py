@@ -4,7 +4,8 @@ Three layers of FLOOD_WAIT defence, extracted from a production Telegram
 content collector:
 
 - proactive rate-limit gate: sliding-window buckets per (phone, category)
-  checked *before* a Telegram call is made (``TelegramRateLimitGate``);
+  and, for sends, per (phone, category, peer) — checked *before* a Telegram
+  call is made (``TelegramRateLimitGate``);
 - reactive circuit breaker: suspends an (operation, phone) pair that keeps
   drawing flood waits instead of hammering into a long ban
   (``FloodCircuitBreaker``);
@@ -39,8 +40,14 @@ from telethon_floodgate.flood_wait import (
     sleep_for_flood_wait_seconds,
     sleep_for_handled_flood_wait,
 )
+from telethon_floodgate.peer import (
+    PeerKind,
+    peer_key,
+    peer_kind_and_key,
+)
 from telethon_floodgate.rate_limit_gate import (
     RateLimitSpec,
+    TelegramPeerRateLimitedError,
     TelegramRateLimitedError,
     TelegramRateLimitGate,
 )
@@ -58,18 +65,20 @@ __all__ = [
     "DEFAULT_COOLDOWN_SECONDS",
     "DEFAULT_FLOOD_THRESHOLD",
     "FLOOD_WAIT_RETRY_BUFFER_SEC",
-    "TRANSIENT_FLOOD_WAIT_MAX_SEC",
-    "TRANSIENT_FLOOD_WAIT_RETRY_BUDGET_SEC",
     "FloodCircuitBreaker",
     "FloodWaitInfo",
-    "HandledFloodWaitError",
     "GLOBAL_RESOLVE_BACKOFF_THRESHOLD_SEC",
-    "RateLimitSpec",
+    "HandledFloodWaitError",
+    "PeerKind",
     "RESOLVE_USERNAME_BACKOFF_BUFFER_SEC",
     "ResolveRateLimiter",
+    "RateLimitSpec",
     "TelegramOperationSuspendedError",
-    "TelegramRateLimitGate",
+    "TelegramPeerRateLimitedError",
     "TelegramRateLimitedError",
+    "TelegramRateLimitGate",
+    "TRANSIENT_FLOOD_WAIT_MAX_SEC",
+    "TRANSIENT_FLOOD_WAIT_RETRY_BUDGET_SEC",
     "UsernameResolveFloodWaitDeferredError",
     "UsernameResolveRateLimitedError",
     "coerce_flood_wait_seconds",
@@ -79,6 +88,8 @@ __all__ = [
     "is_blocking_flood_wait_until",
     "is_transient_flood_wait_seconds",
     "is_transient_flood_wait_until",
+    "peer_key",
+    "peer_kind_and_key",
     "run_with_flood_wait",
     "run_with_flood_wait_retry",
     "sleep_for_flood_wait_seconds",
