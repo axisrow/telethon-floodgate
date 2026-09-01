@@ -38,6 +38,7 @@ Changelog = "https://github.com/axisrow/telethon-floodgate/blob/main/CHANGELOG.m
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
+    "pytest-timeout>=2.3",
     "ruff>=0.8",
     "build>=1.2",
     "twine>=6.0",
@@ -60,4 +61,11 @@ select = ["E", "F", "I", "N", "W"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+# tests_live/ is deliberately OUTSIDE testpaths: the default run and CI never
+# collect live tests; they are invoked explicitly (pytest tests_live) and are
+# additionally gated by RUN_FLOODGATE_LIVE_TG at runtime.
+markers = [
+    "live_tg_ro: opt-in read-only live Telegram test; gate: RUN_FLOODGATE_LIVE_TG=1",
+    "live_tg_send: opt-in live Telegram test sending to Saved Messages only; gate: RUN_FLOODGATE_LIVE_TG=1",
+]
 filterwarnings = ["error"]

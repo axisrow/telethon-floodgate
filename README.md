@@ -146,3 +146,46 @@ storage-agnostic.
 
 MIT — see [LICENSE](LICENSE). Unofficial third-party library; not affiliated
 with the Telethon project.
+
+## Live testing
+
+The offline suite (default `pytest`, CI) never touches Telegram. Live checks
+are a separate, explicit activity, in four levels:
+
+- **Level 0 — consumer suite (free):** every project using this package
+  exercises it through its own real-Telegram test rig.
+- **Level 1 — `tests_live/` (opt-in):** outside `testpaths`, so the default
+  run never even collects them. Gated by `RUN_FLOODGATE_LIVE_TG=1` plus the
+  account environment:
+  ```bash
+  export REAL_TG_API_ID=... REAL_TG_API_HASH=... REAL_TG_PHONE=... REAL_TG_SESSION=...
+  RUN_FLOODGATE_LIVE_TG=1 pytest tests_live -s
+  ```
+  With the gate closed every test skips; with the gate open but the account
+  env missing they fail loudly naming the variables. `test_live_peer_keys`
+  (read-only) classifies every real `get_dialogs()` entity and fails on any
+  UNKNOWN kind or malformed key; `test_live_send_gate` sends 5 messages to
+  Saved Messages through the real gate and proves the 1/s user-peer pacing
+  engages with no FloodWaitError.
+- **Level 2 — calibration (manual):** `scripts/calibrate_send_limits.py`
+  probes the raw boundary without our gate — fixed interval points, hard
+  budgets (`--max-messages`, `--max-seconds`), auto-stop on the first flood
+  (which is the measurement), JSON report with a verdict against
+  `SEND_PEER_USER_SPEC`:
+  ```bash
+  RUN_FLOODGATE_LIVE_TG=1 python scripts/calibrate_send_limits.py
+  ```
+- **Level 3 — artifact smoke (per release):** install the published wheel
+  into a clean venv and run the level-1 read-only test against it.
+
+Getting a session string from a tg_content_factory installation:
+
+```bash
+python -m src.main account export-session --phone +7... [--json]
+```
+
+The session string grants **full access** to the account — pass it via the
+environment only. Safety rules: use a disposable account, send only to
+Saved Messages (`"me"`), respect the budgets, and expect every live run to
+be a conscious decision. pytest does not read `.env` itself; use
+`set -a; source .env; set +a` if you keep the variables there.
