@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from telethon.errors import FloodWaitError
 
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "calibrate_send_limits.py"
@@ -48,13 +49,22 @@ class _FakeClock:
 
 
 class _FakeClient:
-    """send_message/delete_messages double with a scripted flood point."""
+    """send_message/delete_messages double with scripted failure points."""
 
-    def __init__(self, *, flood_at: int | None = None, flood_seconds: int = 30) -> None:
+    def __init__(
+        self,
+        *,
+        flood_at: int | None = None,
+        flood_seconds: int = 30,
+        fail_at: int | None = None,
+    ) -> None:
         self.flood_at = flood_at
         self.flood_seconds = flood_seconds
+        self.fail_at = fail_at
         self.sent: list[str] = []
+        self.sent_peers: list[Any] = []
         self.deleted: list[list[int]] = []
+        self.deleted_peers: list[Any] = []
         self._next_id = 1
 
     async def send_message(self, peer: Any, text: str) -> Any:
@@ -62,12 +72,16 @@ class _FakeClient:
             err = FloodWaitError(request=None, capture=0)
             err.seconds = self.flood_seconds
             raise err
+        if self.fail_at is not None and len(self.sent) == self.fail_at:
+            raise RuntimeError("scripted non-flood failure")
         self.sent.append(text)
+        self.sent_peers.append(peer)
         message = SimpleNamespace(id=self._next_id)
         self._next_id += 1
         return message
 
     async def delete_messages(self, peer: Any, ids: list[int]) -> None:
+        self.deleted_peers.append(peer)
         self.deleted.append(list(ids))
 
 
@@ -105,6 +119,50 @@ async def test_flood_stops_the_run_and_is_reported_as_the_measurement():
     payload = json.loads(report.to_json())
     assert payload["flooded_at_interval"] == 0.5
     assert payload["safe_interval"] == 1.0
+    # Every send and the cleanup targeted the same peer.
+    assert set(client.sent_peers) == {"me"}
+    assert client.deleted_peers == ["me"]
+
+
+async def test_non_flood_failure_still_cleans_up_probe_messages():
+    """Review finding: cleanup must not depend on a graceful loop exit."""
+    clock = _FakeClock()
+    client = _FakeClient(fail_at=2)
+
+    with pytest.raises(RuntimeError, match="scripted non-flood failure"):
+        await calibrate.run_calibration(
+            client,
+            peer="me",
+            intervals=(1.0,),
+            messages_per_point=5,
+            sleep=clock.sleep,
+            monotonic=clock,
+        )
+
+    # Two probes went out; the finally-path deleted them without any
+    # post-flood sleep (none was observed).
+    assert len(client.sent) == 2
+    assert client.deleted == [[1, 2]]
+    assert client.deleted_peers == ["me"]
+
+
+async def test_zero_second_flood_still_waits_before_deleting():
+    """A malformed FloodWaitError (seconds <= 0) must still pace the cleanup."""
+    clock = _FakeClock()
+    client = _FakeClient(flood_at=0, flood_seconds=0)
+
+    report = await calibrate.run_calibration(
+        client,
+        peer="me",
+        intervals=(1.0,),
+        messages_per_point=3,
+        sleep=clock.sleep,
+        monotonic=clock,
+    )
+
+    assert report.points[0].flooded
+    # max(0, 1.0) + the 2s buffer — the minimum safe pause happened.
+    assert 1.0 + calibrate.POST_FLOOD_BUFFER_SEC in clock.slept
 
 
 async def test_max_messages_budget_stops_without_a_flood():

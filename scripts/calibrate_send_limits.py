@@ -111,9 +111,20 @@ async def run_calibration(
 
     ``client`` needs only ``send_message(peer, text)`` and
     ``delete_messages(peer, ids)`` awaitables — enough for a fake in tests.
+
+    Contract: this function SENDS FOR REAL when given a real client and is
+    deliberately not gated — the ``RUN_FLOODGATE_LIVE_TG`` opt-in is enforced
+    at the real-client boundary in ``main()``, which also pins ``peer`` to the
+    authenticated account itself (Saved Messages). The ``peer`` parameter
+    exists for the offline fake; passing a third-party peer here is the
+    caller's explicit choice, not something the CLI exposes.
+
+    Cleanup is guaranteed: the probe loop runs under ``finally``, so probe
+    messages are deleted even when a non-flood exception interrupts the run.
     """
     report = CalibrationReport()
     started = monotonic()
+    flood_wait_sec: float | None = None
 
     def _budget_exhausted() -> bool:
         if len(report.message_ids) >= max_messages:
@@ -124,47 +135,48 @@ async def run_calibration(
             return True
         return False
 
-    flood_wait_sec: float | None = None
-    paced_once = False  # at least one send has happened in the whole run
-    budget_stop = False
-    for interval in intervals:
-        point = PointResult(interval=interval, sent=0)
-        for _ in range(messages_per_point):
-            if paced_once:
-                # Pace consecutive sends at `interval`. After a settle pause
-                # this over-waits by one interval — deliberately conservative
-                # for an account-probing script.
-                await sleep(interval)
-            # Budgets are checked right before the actual send (after the
-            # pacing sleep), so a budget stop never fires an extra message.
-            if _budget_exhausted():
-                budget_stop = True
+    try:
+        paced_once = False  # at least one send has happened in the whole run
+        budget_stop = False
+        for interval in intervals:
+            point = PointResult(interval=interval, sent=0)
+            for _ in range(messages_per_point):
+                if paced_once:
+                    # Pace consecutive sends at `interval`. After a settle
+                    # pause this over-waits by one interval — deliberately
+                    # conservative for an account-probing script.
+                    await sleep(interval)
+                # Budgets are checked right before the actual send (after the
+                # pacing sleep), so a budget stop never fires an extra message.
+                if _budget_exhausted():
+                    budget_stop = True
+                    break
+                try:
+                    message = await client.send_message(peer, _probe_text(interval, point.sent))
+                    report.message_ids.append(message.id)
+                    point.sent += 1
+                    paced_once = True
+                except FloodWaitError as exc:
+                    seconds = float(getattr(exc, "seconds", 0) or 0)
+                    point.flooded = True
+                    point.flood_wait_sec = seconds
+                    flood_wait_sec = seconds
+                    report.flooded_at_interval = interval
+                    break
+            report.points.append(point)
+            if budget_stop or point.flooded:
+                if point.flooded:
+                    report.stopped_reason = "flood wait observed"
                 break
-            try:
-                message = await client.send_message(peer, _probe_text(interval, point.sent))
-                report.message_ids.append(message.id)
-                point.sent += 1
-                paced_once = True
-            except FloodWaitError as exc:
-                seconds = float(getattr(exc, "seconds", 0) or 0)
-                point.flooded = True
-                point.flood_wait_sec = seconds
-                flood_wait_sec = seconds
-                report.flooded_at_interval = interval
-                break
-        report.points.append(point)
-        if budget_stop or point.flooded:
-            if point.flooded:
-                report.stopped_reason = "flood wait observed"
-            break
-        if interval != intervals[-1]:
-            await sleep(settle_seconds)
+            if interval != intervals[-1]:
+                await sleep(settle_seconds)
+    finally:
+        clean = [p.interval for p in report.points if not p.flooded and p.sent > 0]
+        report.safe_interval = min(clean) if clean else None
+        if report.stopped_reason == "completed" and not clean:
+            report.stopped_reason = "no sends succeeded"
+        await _finish(client, peer, report, flood_wait_sec, sleep)
 
-    clean = [point.interval for point in report.points if not point.flooded and point.sent > 0]
-    report.safe_interval = min(clean) if clean else None
-    if report.stopped_reason == "completed" and not clean:
-        report.stopped_reason = "no sends succeeded"
-    await _finish(client, peer, report, flood_wait_sec, sleep)
     return report
 
 
@@ -175,10 +187,11 @@ async def _finish(
     flood_wait_sec: float | None,
     sleep: SleepFn,
 ) -> None:
-    if flood_wait_sec is not None and flood_wait_sec > 0:
+    if flood_wait_sec is not None:
         # Wait out the flood BEFORE deleting: deletion is an API call too and
-        # must not strike the already-flooded account.
-        await sleep(flood_wait_sec + POST_FLOOD_BUFFER_SEC)
+        # must not strike the already-flooded account. Any observed flood
+        # (even one reporting seconds <= 0) earns at least a 1s pause.
+        await sleep(max(flood_wait_sec, 1.0) + POST_FLOOD_BUFFER_SEC)
     report.recommendation = build_recommendation(report.safe_interval)
     if not report.message_ids:
         report.cleaned_up = True
