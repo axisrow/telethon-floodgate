@@ -13,3 +13,16 @@ project, plus per-peer send limits.
 - `ResolveRateLimiter`: sliding-window limiter for `auth.resolveUsername`
 - flood-wait helpers: `run_with_flood_wait`, `run_with_flood_wait_retry`,
   transient/blocking classification, sleep helpers, `FloodWaitInfo`
+
+## 0.1.1 (unreleased)
+
+Dev-only: opt-in live-testing harness (no runtime changes).
+
+- `tests_live/` outside `testpaths`: gated live tests (`RUN_FLOODGATE_LIVE_TG=1`
+  + `REAL_TG_*` env) — read-only peer-key classification over real dialogs and
+  a bounded send test proving the per-peer 1/s bucket paces Saved-Messages
+  traffic with no FloodWaitError
+- `scripts/calibrate_send_limits.py`: manual raw-boundary probe with fixed
+  interval points, hard budgets and auto-stop on the first flood
+- offline invariants in CI: marker registration, default-run exclusion,
+  no-secret-literals audit, full gate-policy matrix

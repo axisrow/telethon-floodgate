@@ -16,7 +16,7 @@ jobs:
       - name: Install
         run: pip install -e ".[dev]"
       - name: Ruff
-        run: ruff check src tests
+        run: ruff check src tests tests_live scripts
       - name: Build + twine check
         run: |
           python -m build
