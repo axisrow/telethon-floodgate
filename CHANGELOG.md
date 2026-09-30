@@ -16,7 +16,15 @@ project, plus per-peer send limits.
 
 ## 0.1.1 (unreleased)
 
-Dev-only: opt-in live-testing harness (no runtime changes).
+Shared async pacing plus the opt-in live-testing harness.
+
+- `TokenBucket`: smooth-refill outgoing cap extracted from tg_messenger,
+  retaining its burst, rate opt-out, injectable time/sleep and fair wait queue
+- `TelegramRateLimitGate.acquire`: wait and re-acquire one category slot after
+  every deferral; cancellation propagates without a new reservation
+- `TelegramRateLimitGate.wrap_messages_iterator`: gate actual Telethon history,
+  search and ID-fetch page RPCs without modifying the shared client; no changes
+  to category defaults, per-peer policy, or the existing retry/error APIs
 
 - `tests_live/` outside `testpaths`: gated live tests (`RUN_FLOODGATE_LIVE_TG=1`
   + `REAL_TG_*` env) — read-only peer-key classification over real dialogs and

@@ -8,11 +8,32 @@ so a new production sample can be applied without changing call sites.
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any
+
+from telethon.requestiter import RequestIter
+from telethon.tl.functions import channels, messages
 
 from telethon_floodgate.rate_limiter import ResolveRateLimiter
+
+logger = logging.getLogger(__name__)
+
+# Only message-fetch RPCs belong to an iterator's history budget. Telethon also
+# retains the iterator's client on returned Message objects, whose later calls
+# (edits, reactions, etc.) must not accidentally consume history slots.
+_MESSAGE_REQUESTS = (
+    messages.GetHistoryRequest,
+    messages.SearchRequest,
+    messages.SearchGlobalRequest,
+    messages.GetRepliesRequest,
+    messages.GetScheduledHistoryRequest,
+    messages.GetMessagesRequest,
+    channels.GetMessagesRequest,
+)
 
 # One sweep = the initial pass plus its resumptions. Kept in step with
 # DIALOG_FETCH_MAX_PASSES in pool_dialogs (12) so the gate can never be the
@@ -206,6 +227,45 @@ class TelegramRateLimitGate:
             phone, slots
         )
 
+    async def acquire(
+        self,
+        phone: str,
+        category: str,
+        *,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        """Wait for one category slot; a deferral reserves nothing.
+
+        Re-check after every sleep, including when another waiter took the
+        available slot first. Cancellation propagates without reserving a slot.
+        Per-peer/compound reservations retain the explicit ``try_acquire`` API.
+        """
+        while (retry_after := self.try_acquire(phone, category)) > 0:
+            logger.info("%s: rate-limit gate defers %.1fs", category, retry_after)
+            await sleep(retry_after)
+
+    def wrap_messages_iterator(
+        self,
+        iterator: RequestIter,
+        phone: str,
+        *,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> RequestIter:
+        """Gate every message-fetch RPC of a fresh Telethon ``iter_messages``.
+
+        Wrap before iterating; do not also reserve a logical history slot.
+        The raw client is unchanged, so concurrent iterators remain independent.
+        Flood-wait retry stays with the caller. Unsupported/already wrapped
+        iterators fail explicitly rather than silently bypassing the gate.
+        """
+        client = getattr(iterator, "client", None)
+        if not callable(client):
+            raise TypeError("message iterator must expose a callable client")
+        if isinstance(client, _MessageGateClient):
+            raise ValueError("message iterator is already rate-limited")
+        iterator.client = _MessageGateClient(client, self, phone, sleep)
+        return iterator
+
     def reset(self, phone: str | None = None, category: str | None = None) -> None:
         limiters = self._limiters.values() if category is None else [self._limiters[category]]
         for limiter in limiters:
@@ -249,3 +309,27 @@ class TelegramRateLimitGate:
         else:
             self._peer_buckets.move_to_end(key)
         return limiter.try_acquire_many(phone, slots)
+
+
+class _MessageGateClient:
+    """Per-iterator proxy, not a monkeypatch of the shared TelegramClient."""
+
+    def __init__(
+        self,
+        client: Any,
+        gate: TelegramRateLimitGate,
+        phone: str,
+        sleep: Callable[[float], Awaitable[None]],
+    ) -> None:
+        self._client = client
+        self._gate = gate
+        self._phone = phone
+        self._sleep = sleep
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+    async def __call__(self, request: Any, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(request, _MESSAGE_REQUESTS):
+            await self._gate.acquire(self._phone, "history", sleep=self._sleep)
+        return await self._client(request, *args, **kwargs)
