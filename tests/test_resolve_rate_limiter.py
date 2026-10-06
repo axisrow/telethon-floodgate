@@ -108,3 +108,116 @@ def test_reset_clears_history():
     limiter.try_acquire("+2")
     limiter.reset()
     assert limiter.try_acquire("+2") == 0.0
+
+
+class _TieredFakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _tiered(clock, *, burst_calls=20, sustained_calls=60):
+    return ResolveRateLimiter(
+        max_calls=burst_calls,
+        window_sec=60.0,
+        jitter_sec=0.0,
+        time_func=clock,
+        jitter_func=lambda _a, _b: 0.0,
+        sustained_max_calls=sustained_calls,
+        sustained_window_sec=3600.0,
+    )
+
+
+def test_sustained_tier_caps_accumulated_volume():
+    """Sustained tier caps volume that the burst window admits legally.
+
+    Production incident (tg_content_factory 2026-10-06): a cold collect of
+    623 channels fired 20 resolves/min — every 60s burst window green — for
+    20+ minutes until Telegram answered FLOOD_WAIT 49613s. 180 minutes of
+    the same pattern must now yield at most one sustained window per hour.
+    """
+    clock = _TieredFakeClock()
+    limiter = _tiered(clock)
+
+    allowed = 0
+    for _ in range(180):  # 3 hours, 20 "legal" calls per minute
+        for _ in range(20):
+            if limiter.try_acquire("+1") == 0.0:
+                allowed += 1
+        clock.now += 60.0
+
+    assert allowed <= 180
+
+
+def test_without_sustained_tier_volume_is_uncapped():
+    """Back-compat: no sustained params -> 0.1.x behaviour (burst only)."""
+    clock = _TieredFakeClock()
+    limiter = ResolveRateLimiter(
+        max_calls=20,
+        window_sec=60.0,
+        jitter_sec=0.0,
+        time_func=clock,
+        jitter_func=lambda _a, _b: 0.0,
+    )
+
+    allowed = 0
+    for _ in range(180):
+        for _ in range(20):
+            if limiter.try_acquire("+1") == 0.0:
+                allowed += 1
+        clock.now += 60.0
+
+    assert allowed == 3600
+
+
+def test_sustained_window_slides():
+    """After an hour the sustained budget is fully restored."""
+    clock = _TieredFakeClock()
+    # Wide burst window: isolate the sustained tier's behaviour.
+    limiter = _tiered(clock, burst_calls=60)
+
+    for _ in range(60):
+        assert limiter.try_acquire("+1") == 0.0
+    # Burst window is green again, but the sustained hour is exhausted.
+    clock.now += 60.0
+    assert limiter.try_acquire("+1") > 0.0
+    # Sustained calls made at t=0 leave the sustained window at t=3600.
+    clock.now = 3600.0
+    assert limiter.try_acquire("+1") == 0.0
+
+
+def test_sustained_tier_is_per_account():
+    clock = _TieredFakeClock()
+    limiter = _tiered(clock, sustained_calls=1)
+
+    assert limiter.try_acquire("+1") == 0.0
+    assert limiter.try_acquire("+1") > 0.0
+    assert limiter.try_acquire("+2") == 0.0
+
+
+def test_sustained_params_must_come_in_pair():
+    import pytest
+
+    with pytest.raises(ValueError):
+        ResolveRateLimiter(sustained_max_calls=60)
+    with pytest.raises(ValueError):
+        ResolveRateLimiter(sustained_window_sec=3600.0)
+
+
+def test_sustained_window_cannot_be_narrower_than_burst():
+    import pytest
+
+    with pytest.raises(ValueError):
+        ResolveRateLimiter(sustained_max_calls=60, sustained_window_sec=30.0)
+
+
+def test_reset_clears_sustained_window():
+    clock = _TieredFakeClock()
+    limiter = _tiered(clock, sustained_calls=1)
+
+    assert limiter.try_acquire("+1") == 0.0
+    assert limiter.try_acquire("+1") > 0.0
+    limiter.reset("+1")
+    assert limiter.try_acquire("+1") == 0.0

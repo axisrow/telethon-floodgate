@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.1.2 (unreleased)
+
+Sustained-volume tier for `ResolveRateLimiter` — caps accumulated call
+volume, not just per-minute bursts.
+
+- Production incident (tg_content_factory 2026-10-06): a cold collect of
+  623 channels fired 20 resolves/min — every 60s burst window green — for
+  20+ minutes until Telegram answered `FLOOD_WAIT_49613`. The burst window
+  alone cannot see accumulated volume.
+- `ResolveRateLimiter` gains optional `sustained_max_calls` /
+  `sustained_window_sec` (second sliding window, same deque math).
+  Recommended companion to the 20/60s burst: 60 calls / 3600s.
+- Both windows are checked first; timestamps are recorded in both only when
+  both admit the call — a deferred call burns no slots (unlike composing two
+  separate limiter instances).
+- Defaults unchanged (`None` = disabled, bit-for-bit 0.1.x behaviour);
+  consumers opt in per instance. Validation: params must come in a pair,
+  sustained window cannot be narrower than the burst window; `reset()`
+  clears both windows.
+
 ## 0.1.0 (unreleased)
 
 Initial release — 1:1 extraction of the flood stack from the tg_content_factory

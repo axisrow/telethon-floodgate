@@ -59,7 +59,7 @@ from telethon_floodgate.rate_limiter import (
     UsernameResolveRateLimitedError,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.1.2"
 
 __all__ = [
     "DEFAULT_COOLDOWN_SECONDS",
