@@ -339,6 +339,33 @@ def test_flood_backoff_escalates_and_caps() -> None:
     assert gate.note_flood("+1", 10.0) == 8.0  # capped at the default cap
 
 
+def test_flood_backoff_survives_a_flood_storm() -> None:
+    """1024+ events inside the decay window must clamp, not overflow float.
+
+    try_acquire never raises — the pow is clamped BEFORE min() with the cap,
+    so a tight report/retry loop (1024 events/hour is reachable at 1-3s
+    floods) cannot crash the gate during the storm.
+    """
+    clock = _Clock()
+    gate = _flooded_gate(clock)
+    multiplier = 1.0
+    for _ in range(1100):
+        multiplier = gate.note_flood("+1", 1.0)
+    assert multiplier == 8.0
+    gate.try_acquire("+1", "send")
+    assert gate.try_acquire("+1", "send") == 480.0
+
+
+def test_category_scoped_reset_keeps_flood_events() -> None:
+    clock = _Clock()
+    gate = _flooded_gate(clock)
+    gate.note_flood("+1", 30.0)
+    gate.reset(category="send")
+    assert gate.snapshot("+1")["flood_multiplier"] == 2.0
+    gate.reset()
+    assert gate.snapshot("+1")["flood_multiplier"] == 1.0
+
+
 def test_flood_backoff_scales_peer_defers_too() -> None:
     clock = _Clock()
     gate = _flooded_gate(

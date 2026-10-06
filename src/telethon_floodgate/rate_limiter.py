@@ -193,7 +193,15 @@ class ResolveRateLimiter:
         return 0.0
 
     def used(self, phone: str) -> int:
-        """Calls recorded inside the current window for ``phone`` (prunes first)."""
+        """Burst-window calls recorded for ``phone`` (prunes first).
+
+        Read-only: an unknown phone seeds no window entry (dashboards may
+        ask about arbitrary accounts). A sustained tier, if configured, is
+        not included — this reports the burst window only.
+        """
+        window = self._calls.get(phone)
+        if not window:
+            return 0
         return len(self._prune(phone, self._time()))
 
     def reset(self, phone: str | None = None) -> None:

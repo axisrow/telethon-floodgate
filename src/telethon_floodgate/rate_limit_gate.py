@@ -297,7 +297,10 @@ class TelegramRateLimitGate:
             events.popleft()
         if not events:
             return 1.0
-        return min(2.0 ** len(events), self._flood_backoff_cap)
+        # Clamp the exponent before the pow: 2.0 ** 1024 overflows float and
+        # would raise inside try_acquire — exactly during a flood storm. The
+        # cap collapses anything above it anyway.
+        return min(2.0 ** min(len(events), 60), self._flood_backoff_cap)
 
     def try_acquire(
         self, phone: str, category: str, *, slots: int = 1, peer: str | None = None
@@ -362,12 +365,17 @@ class TelegramRateLimitGate:
             limiter.reset(phone)
         if phone is None:
             self._peer_buckets.clear()
-            self._flood_events.clear()
+            # Flood events have no category dimension — only a full reset
+            # may wipe them; a category-scoped reset would otherwise drop
+            # every account's accumulated backoff as a side effect.
+            if category is None:
+                self._flood_events.clear()
         else:
             stale = [key for key in self._peer_buckets if key[0] == phone]
             for key in stale:
                 del self._peer_buckets[key]
-            self._flood_events.pop(phone, None)
+            if category is None:
+                self._flood_events.pop(phone, None)
 
     def _peer_spec_for(self, category: str, peer: str) -> RateLimitSpec | None:
         kind = peer.split(":", 1)[0] if ":" in peer else ""
