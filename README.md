@@ -53,6 +53,46 @@ gate = TelegramRateLimitGate(
 project those paths have dedicated limiters (see `ResolveRateLimiter`, also
 shipped here).
 
+### Async callers and paginated history
+
+`await gate.acquire(phone, category)` waits for one category slot, rechecking
+after each deferral. Cancellation propagates normally. Reserve **inside** the
+retry factory so every attempted call is counted:
+
+```python
+from telethon_floodgate import run_with_flood_wait_retry
+
+async def send_attempt():
+    await gate.acquire(phone, "send")
+    return await client.send_message(peer, text)
+
+await run_with_flood_wait_retry(send_attempt, operation="send")
+
+async def fetch_history():
+    iterator = gate.wrap_messages_iterator(client.iter_messages(peer, limit=250), phone)
+    return [message async for message in iterator]
+
+await run_with_flood_wait_retry(fetch_history, operation="history")
+```
+
+`wrap_messages_iterator` reserves a `history` slot for **each message-fetch RPC**,
+including search and ID batches, rather than once for the entire iterator. Do
+not also acquire an outer history slot. The per-iterator proxy leaves the shared
+client unchanged and passes unrelated requests through. It requires a fresh
+Telethon-style iterator with a writable, callable `client`; unsupported or
+already wrapped iterators fail explicitly. Recreate it inside the retry factory.
+
+These async helpers accept `sleep=`; pair it with the gate's `time_func=` in
+offline tests. They do not enable per-peer limiting: use `try_acquire` for
+per-peer or compound reservations.
+
+`TokenBucket(rate_per_min, burst=1, clock=..., sleep=...)` provides a separate
+smooth-refill outgoing cap. `await bucket.acquire()` waits in a fair queue and
+logs a warning when exhausted; `bucket.enabled` is false for non-positive rates.
+The bucket is per client/event loop, not a cross-process account-wide ceiling.
+Consumers choose its rate/burst and which logical operations consume tokens;
+the category gate can independently constrain bursts and retries.
+
 ### Per-peer send limits
 
 Telegram throttles *sending* per peer, not just per account: roughly one
@@ -135,8 +175,8 @@ storage-agnostic.
 
 ## Design notes
 
-- Everything runs on one event loop; the limiter state is plain in-memory
-  deques, no locks, no DB.
+- Everything runs on one event loop with in-memory state and no DB. The gate
+  uses plain deques; `TokenBucket` serializes its waiters with an `asyncio.Lock`.
 - `try_acquire` never sleeps and never raises — it returns seconds to defer,
   so callers decide whether to reschedule, skip or await.
 - Atomic multi-slot reservations (`try_acquire(..., slots=n)`) are supported

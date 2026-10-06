@@ -14,6 +14,18 @@ project, plus per-peer send limits.
 - flood-wait helpers: `run_with_flood_wait`, `run_with_flood_wait_retry`,
   transient/blocking classification, sleep helpers, `FloodWaitInfo`
 
+## 0.1.2 (unreleased)
+
+Shared async pacing plus the opt-in live-testing harness.
+
+- `TokenBucket`: smooth-refill outgoing cap extracted from tg_messenger,
+  retaining its burst, rate opt-out, injectable time/sleep and fair wait queue
+- `TelegramRateLimitGate.acquire`: wait and re-acquire one category slot after
+  every deferral; cancellation propagates without a new reservation
+- `TelegramRateLimitGate.wrap_messages_iterator`: gate actual Telethon history,
+  search and ID-fetch page RPCs without modifying the shared client; no changes
+  to category defaults, per-peer policy, or the existing retry/error APIs
+
 ## 0.1.1 (2026-10-07)
 
 Opt-in live-testing harness + sustained-volume tier for `ResolveRateLimiter`.

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from telethon_floodgate.rate_limit_gate import (
@@ -229,3 +231,68 @@ def test_peer_error_is_a_rate_limit_error() -> None:
     assert exc.peer == "user:42"
     assert exc.category == "send_peer"
     assert exc.retry_after_sec == 3.5
+
+
+async def test_acquire_rechecks_after_early_wakeup_and_reserves() -> None:
+    clock = _Clock()
+    gate = TelegramRateLimitGate(time_func=clock)
+    gate.try_acquire("+1", "dialogs")
+    sleeps = []
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+        clock.now += seconds / 2 if len(sleeps) == 1 else seconds
+
+    await gate.acquire("+1", "dialogs", sleep=sleep)
+    assert sleeps == [60.0, 30.0]
+    assert gate.try_acquire("+1", "dialogs") == 60.0
+
+
+async def test_concurrent_acquire_never_admits_unrecorded_waiters() -> None:
+    clock = _Clock()
+    gate = TelegramRateLimitGate(time_func=clock)
+    waiters = []
+    admitted = []
+
+    async def sleep(seconds):
+        future = asyncio.get_running_loop().create_future()
+        waiters.append((seconds, future))
+        await future
+
+    async def acquire():
+        await gate.acquire("+1", "dialogs", sleep=sleep)
+        admitted.append(clock.now)
+
+    await acquire()  # fills the window
+    tasks = [asyncio.create_task(acquire()) for _ in range(2)]
+    await asyncio.sleep(0)
+    assert len(waiters) == 2
+    clock.now += 60
+    for _, future in waiters[:]:
+        future.set_result(None)
+    await asyncio.sleep(0)
+    assert admitted == [1000.0, 1060.0]
+    assert len(waiters) == 3  # the losing waiter must wait again
+    clock.now += 60
+    waiters[-1][1].set_result(None)
+    await asyncio.gather(*tasks)
+    assert admitted == [1000.0, 1060.0, 1120.0]
+
+
+async def test_cancelling_acquire_does_not_reserve_or_block_others() -> None:
+    clock = _Clock()
+    gate = TelegramRateLimitGate(time_func=clock)
+    await gate.acquire("+1", "dialogs")
+    sleeping = asyncio.Event()
+
+    async def sleep(seconds):
+        sleeping.set()
+        await asyncio.Future()
+
+    task = asyncio.create_task(gate.acquire("+1", "dialogs", sleep=sleep))
+    await sleeping.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    clock.now += 60
+    assert gate.try_acquire("+1", "dialogs") == 0.0
