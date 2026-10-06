@@ -410,7 +410,12 @@ def test_snapshot_reports_category_and_peer_usage() -> None:
     }
     assert snap["categories"]["send"]["used"] == 1
     assert snap["peer_buckets"] == {
-        "send:user:42": {"max_calls": 1, "window_sec": 1.1, "used": 1},
+        "send:user:42": {
+            "max_calls": 1,
+            "window_sec": 1.1,
+            "jitter_sec": 0.15,
+            "used": 1,
+        },
     }
 
 

@@ -264,9 +264,15 @@ class TelegramRateLimitGate:
             if bucket_phone != phone:
                 continue
             spec = self._peer_spec_for(category, peer)
+            if spec is None:  # unreachable: buckets exist only for configured specs
+                continue
             peers[f"{category}:{peer}"] = {
-                "max_calls": spec.max_calls if spec else None,
-                "window_sec": spec.window_sec if spec else None,
+                "max_calls": spec.max_calls,
+                "window_sec": spec.window_sec,
+                # The peer limiter bakes this into its defer before the flood
+                # multiplier scales it — a dashboard predicting defers from
+                # max_calls/window_sec alone would undershoot send:user.
+                "jitter_sec": spec.jitter_sec,
                 "used": self._peer_buckets[(bucket_phone, category, peer)].used(phone),
             }
         return {
