@@ -81,6 +81,8 @@ class ResolveRateLimiter:
         jitter_sec: float = DEFAULT_JITTER_SEC,
         time_func=time.monotonic,
         jitter_func=random.uniform,
+        sustained_max_calls: int | None = None,
+        sustained_window_sec: float | None = None,
     ) -> None:
         self._max_calls = max(1, int(max_calls))
         self._window_sec = float(window_sec)
@@ -88,13 +90,42 @@ class ResolveRateLimiter:
         self._time = time_func
         self._jitter = jitter_func
         self._calls: dict[str, deque[float]] = defaultdict(deque)
+        # Sustained tier (tg_content_factory incident 2026-10-06): the burst
+        # window alone admitted an unbounded *stream* of fully-legal calls
+        # (20/min for 20+ minutes) and Telegram escalated to a 13.8h
+        # FLOOD_WAIT. The second, wider window caps accumulated volume; the
+        # recommended companion to the 20/60s burst is 60 calls / 3600s.
+        # Disabled (None) keeps the 0.1.x behaviour bit-for-bit.
+        if (sustained_max_calls is None) != (sustained_window_sec is None):
+            raise ValueError(
+                "sustained_max_calls and sustained_window_sec must be set together"
+            )
+        self._sustained_calls: dict[str, deque[float]] | None = None
+        if sustained_max_calls is not None:
+            sustained_window_sec_f = float(sustained_window_sec)  # type: ignore[arg-type]
+            if sustained_window_sec_f < self._window_sec:
+                raise ValueError(
+                    "sustained_window_sec must be >= window_sec: the sustained "
+                    "window cannot be narrower than the burst window"
+                )
+            self._sustained_max_calls = max(1, int(sustained_max_calls))
+            self._sustained_window_sec = sustained_window_sec_f
+            self._sustained_calls = defaultdict(deque)
+        else:
+            self._sustained_max_calls = 0
+            self._sustained_window_sec = 0.0
 
-    def _prune(self, phone: str, now: float) -> deque[float]:
-        window = self._calls[phone]
-        cutoff = now - self._window_sec
+    def _prune_window(
+        self, store: dict[str, deque[float]], phone: str, now: float, window_sec: float
+    ) -> deque[float]:
+        window = store[phone]
+        cutoff = now - window_sec
         while window and window[0] <= cutoff:
             window.popleft()
         return window
+
+    def _prune(self, phone: str, now: float) -> deque[float]:
+        return self._prune_window(self._calls, phone, now, self._window_sec)
 
     def try_acquire(self, phone: str) -> float:
         """Reserve one resolve slot for ``phone``.
@@ -106,7 +137,14 @@ class ResolveRateLimiter:
         return self.try_acquire_many(phone, 1)
 
     def try_acquire_many(self, phone: str, slots: int) -> float:
-        """Atomically reserve ``slots`` calls for one compound operation."""
+        """Atomically reserve ``slots`` calls for one compound operation.
+
+        With a sustained tier configured, both windows are checked first and
+        timestamps are recorded in both **only when both admit the call** —
+        a deferred call burns no slots in any window (unlike composing two
+        separate limiter instances, where a burst refusal after a sustained
+        admission would burn a sustained slot).
+        """
         slots = int(slots)
         if slots < 1:
             raise ValueError("slots must be at least 1")
@@ -115,20 +153,52 @@ class ResolveRateLimiter:
 
         now = self._time()
         window = self._prune(phone, now)
-        if len(window) + slots <= self._max_calls:
-            window.extend([now] * slots)
-            return 0.0
-        # Wait until enough calls have expired for the whole atomic request,
-        # not merely until the oldest call leaves the window.
-        calls_to_expire = len(window) + slots - self._max_calls
-        retry_after = (window[calls_to_expire - 1] + self._window_sec) - now
-        if self._jitter_sec:
-            retry_after += self._jitter(0.0, self._jitter_sec)
-        return max(retry_after, 0.0)
+        burst_full = len(window) + slots > self._max_calls
+
+        # Sustained first: when BOTH windows are full, the sustained retry
+        # (~hours) is the honest defer — returning the ~60s burst retry here
+        # would wake every deferred caller one extra cycle per window
+        # (review finding on tg_content_factory#1498).
+        sustained_window: deque[float] | None = None
+        sustained_retry: float | None = None
+        if self._sustained_calls is not None:
+            sustained_window = self._prune_window(
+                self._sustained_calls, phone, now, self._sustained_window_sec
+            )
+            if len(sustained_window) + slots > self._sustained_max_calls:
+                calls_to_expire = len(sustained_window) + slots - self._sustained_max_calls
+                sustained_retry = (
+                    sustained_window[calls_to_expire - 1] + self._sustained_window_sec
+                ) - now
+
+        if burst_full:
+            # Wait until enough calls have expired for the whole atomic request,
+            # not merely until the oldest call leaves the window.
+            calls_to_expire = len(window) + slots - self._max_calls
+            retry_after = (window[calls_to_expire - 1] + self._window_sec) - now
+            if sustained_retry is not None:
+                retry_after = max(retry_after, sustained_retry)
+            if self._jitter_sec:
+                retry_after += self._jitter(0.0, self._jitter_sec)
+            return max(retry_after, 0.0)
+        if sustained_retry is not None:
+            retry = sustained_retry
+            if self._jitter_sec:
+                retry += self._jitter(0.0, self._jitter_sec)
+            return max(retry, 0.0)
+
+        window.extend([now] * slots)
+        if sustained_window is not None:
+            sustained_window.extend([now] * slots)
+        return 0.0
 
     def reset(self, phone: str | None = None) -> None:
         """Drop recorded history for ``phone`` (or all accounts)."""
         if phone is None:
             self._calls.clear()
+            if self._sustained_calls is not None:
+                self._sustained_calls.clear()
         else:
             self._calls.pop(phone, None)
+            if self._sustained_calls is not None:
+                self._sustained_calls.pop(phone, None)
