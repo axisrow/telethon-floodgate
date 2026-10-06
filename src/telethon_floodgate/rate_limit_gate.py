@@ -126,10 +126,10 @@ class TelegramRateLimitGate:
     # check, not by starving it here.
     DIALOG_SWEEP_SPEC = RateLimitSpec(max_calls=DIALOG_SWEEP_MAX_CALLS, window_sec=60.0)
     DIALOG_PAGE_SPEC = RateLimitSpec(max_calls=DIALOG_PAGE_MAX_CALLS, window_sec=60.0)
-    # Phase 2 calibration.  These are intentionally permissive for normal
-    # workloads and should be revisited when a larger production sample is
-    # available; they are not Telegram's documented quotas.
-    HISTORY_SPEC = RateLimitSpec(max_calls=600, window_sec=60.0)
+    # messages.getHistory empirical boundary: 30 requests in roughly 30s on
+    # the calibrated account/channel (31st request returned FLOOD_WAIT_3).
+    # Keep a 20% margin; Telegram does not publish this quota.
+    HISTORY_SPEC = RateLimitSpec(max_calls=24, window_sec=30.0)
     ADMIN_ACTION_SPEC = RateLimitSpec(max_calls=10, window_sec=60.0)
     SEND_SPEC = RateLimitSpec(max_calls=30, window_sec=60.0)
     CHANNEL_LIFECYCLE_SPEC = RateLimitSpec(max_calls=3, window_sec=300.0)
@@ -139,9 +139,11 @@ class TelegramRateLimitGate:
     # INDEPENDENT bucket on top of the per-account ``send`` category — an
     # account bursting into many different peers is still bounded by the
     # category, while an account hammering one peer is stopped long before it.
-    SEND_PEER_USER_SPEC = RateLimitSpec(max_calls=1, window_sec=1.0)
-    SEND_PEER_CHANNEL_SPEC = RateLimitSpec(max_calls=20, window_sec=60.0)
-    SEND_PEER_CHAT_SPEC = RateLimitSpec(max_calls=20, window_sec=60.0)
+    # A small margin absorbs clock/network variation around the one-second
+    # observation; the live test proved this pacing on a real user peer.
+    SEND_PEER_USER_SPEC = RateLimitSpec(max_calls=1, window_sec=1.1)
+    SEND_PEER_CHANNEL_SPEC = RateLimitSpec(max_calls=16, window_sec=60.0)
+    SEND_PEER_CHAT_SPEC = RateLimitSpec(max_calls=16, window_sec=60.0)
 
     def __init__(
         self,

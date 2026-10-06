@@ -99,6 +99,18 @@ def test_phase_two_categories_are_separately_calibrated() -> None:
     assert gate.try_acquire("+1", "send") == 0.0
 
 
+def test_history_uses_empirical_window_with_conservative_margin() -> None:
+    clock = _Clock()
+    gate = TelegramRateLimitGate(time_func=clock)
+
+    for _ in range(24):
+        assert gate.try_acquire("+1", "history") == 0.0
+    assert gate.try_acquire("+1", "history") == 30.0
+
+    clock.now += 30.0
+    assert gate.try_acquire("+1", "history") == 0.0
+
+
 def test_compound_slot_reservation_is_atomic() -> None:
     clock = _Clock()
     gate = TelegramRateLimitGate(time_func=clock)
@@ -112,14 +124,14 @@ def test_compound_slot_reservation_is_atomic() -> None:
 # --- per-peer send limits --------------------------------------------------
 
 
-def test_peer_user_bucket_allows_one_per_second() -> None:
+def test_peer_user_bucket_allows_one_per_1_1_seconds() -> None:
     clock = _Clock()
     gate = TelegramRateLimitGate(time_func=clock)
 
     assert gate.try_acquire("+1", "send", peer="user:42") == 0.0
     assert gate.try_acquire("+1", "send", peer="user:42") > 0.0
-    # The 1s window slides: after a second the same peer is allowed again.
-    clock.now += 1.0
+    # The conservative 1.1s window slides after the configured interval.
+    clock.now += 1.1
     assert gate.try_acquire("+1", "send", peer="user:42") == 0.0
 
 
@@ -141,11 +153,11 @@ def test_peer_refusal_does_not_burn_the_category_slot() -> None:
     assert gate.try_acquire("+1", "send", peer="user:43") > 0.0
 
 
-def test_peer_channel_bucket_allows_twenty_per_minute() -> None:
+def test_peer_channel_bucket_allows_sixteen_per_minute() -> None:
     clock = _Clock()
     gate = TelegramRateLimitGate(time_func=clock)
 
-    for _ in range(20):
+    for _ in range(16):
         assert gate.try_acquire("+1", "send", peer="channel:-100123") == 0.0
     assert gate.try_acquire("+1", "send", peer="channel:-100123") > 0.0
     # A classic chat has the same shape of limit, in its own bucket.
@@ -217,4 +229,3 @@ def test_peer_error_is_a_rate_limit_error() -> None:
     assert exc.peer == "user:42"
     assert exc.category == "send_peer"
     assert exc.retry_after_sec == 3.5
-

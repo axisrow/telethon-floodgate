@@ -4,6 +4,8 @@ Sends ONLY to Saved Messages (peer = the account itself), so no third party
 ever sees test traffic. The gate is the real ``TelegramRateLimitGate`` on
 wall-clock time; the test proves the 1/s user-peer bucket actually engages
 against the live API and that a paced burst draws no FloodWaitError.
+On a flood, leave the probes in Saved Messages until the reported wait has
+expired: cleanup would otherwise make another API call on a flooded account.
 
 Note on the timeout marker: if pytest-timeout fires mid-send the finally
 block may not run and a probe message can stay in Saved Messages. That is
@@ -17,6 +19,7 @@ import time
 import uuid
 
 import pytest
+from telethon.errors import FloodWaitError
 from telethon.tl import types as tl_types
 
 from telethon_floodgate import TelegramRateLimitGate, peer_key
@@ -43,6 +46,8 @@ async def test_gate_paces_sends_to_one_per_second(live_telegram) -> None:
     sent_ids: list[int] = []
     send_stamps: list[float] = []
     deferrals = 0
+    flooded = False
+    cleaned_up = False
 
     try:
         for i in range(MESSAGE_COUNT):
@@ -51,9 +56,8 @@ async def test_gate_paces_sends_to_one_per_second(live_telegram) -> None:
                 deferrals += 1
                 await asyncio.sleep(retry_after)
                 retry_after = gate.try_acquire(live_telegram.phone, "send", peer=key)
-            # A FloodWaitError here is not caught on purpose: it means the
-            # calibrated default is too permissive for this account — exactly
-            # the signal this test exists to surface.
+            # Measure starts: response latency must not shorten the measured gap.
+            send_stamps.append(time.monotonic())
             message = await live_telegram.client.send_message(
                 "me", f"floodgate live probe {nonce} {i}"
             )
@@ -61,12 +65,19 @@ async def test_gate_paces_sends_to_one_per_second(live_telegram) -> None:
                 f"send_message returned {type(message).__name__}, expected Message"
             )
             sent_ids.append(message.id)
-            send_stamps.append(time.monotonic())
+    except FloodWaitError as exc:
+        flooded = True
+        print(
+            f"\nFloodWait: stopped; cleanup skipped. After waiting {exc.seconds}s, "
+            f"delete Saved Messages probes {nonce} (message IDs: {sent_ids})."
+        )
+        raise
     finally:
-        if sent_ids:
+        if sent_ids and not flooded:
             try:
                 if live_telegram.client.is_connected():
                     await live_telegram.client.delete_messages("me", sent_ids)
+                    cleaned_up = True
             except Exception as exc:  # noqa: BLE001 - cleanup must never mask the result
                 print(f"\ncleanup warning: delete_messages failed: {exc}")
 
@@ -79,5 +90,6 @@ async def test_gate_paces_sends_to_one_per_second(live_telegram) -> None:
     assert elapsed >= MIN_ELAPSED_SEC, f"burst finished too fast: {elapsed:.2f}s"
     print(
         f"\nsent {len(sent_ids)} messages in {elapsed:.2f}s "
-        f"(min gap {min(gaps):.2f}s, {deferrals} deferrals), cleaned up"
+        f"(min gap {min(gaps):.2f}s, {deferrals} deferrals), cleaned_up={cleaned_up}"
     )
+    assert cleaned_up, f"probe cleanup incomplete; delete Saved Messages probes {nonce} (message IDs: {sent_ids})"

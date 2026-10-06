@@ -26,3 +26,9 @@ Dev-only: opt-in live-testing harness (no runtime changes).
   interval points, hard budgets and auto-stop on the first flood
 - offline invariants in CI: marker registration, default-run exclusion,
   no-secret-literals audit, full gate-policy matrix
+- live smoke checks surface short flood waits, measure send-start spacing,
+  and skip cleanup after a flood; an offline regression covers variable
+  response latency and immediate/mid-run floods without contacting Telegram
+- empirical quota guardrails: `history` 24 requests / 30s, user-peer sends
+  1 / 1.1s, and channel/chat peer sends 16 / 60s, each with documented
+  evidence and a conservative margin

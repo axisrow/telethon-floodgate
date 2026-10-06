@@ -12,19 +12,25 @@ import re
 import sys
 import tomllib
 from collections.abc import Mapping
+from contextlib import aclosing, nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
+from telethon.errors import FloodWaitError
+from telethon.tl import types as tl_types
+
+from telethon_floodgate import TelegramRateLimitGate
 
 ROOT = Path(__file__).resolve().parents[1]
-POLICY_PATH = ROOT / "tests_live" / "_live_policy.py"
 # A literal assignment to a REAL_TG_* name (only env READS are allowed).
 _SECRET_ASSIGN_RE = re.compile(r"REAL_TG_[A-Z_]+\s*=\s*[\"'][^\"']+")
 
 
-def _load_policy() -> Any:
-    spec = importlib.util.spec_from_file_location("tests_live._live_policy", POLICY_PATH)
+def _load_live_module(name: str) -> Any:
+    spec = importlib.util.spec_from_file_location(f"tests_live.{name}", ROOT / "tests_live" / f"{name}.py")
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     # Register BEFORE exec so lazy annotation lookups inside the module work.
@@ -33,7 +39,7 @@ def _load_policy() -> Any:
     return module
 
 
-policy = _load_policy()
+policy = _load_live_module("_live_policy")
 
 
 def _pytest_config() -> Mapping[str, Any]:
@@ -123,3 +129,60 @@ def test_missing_env_failure_names_every_missing_variable():
     assert action == "fail"
     for name in policy.REQUIRED_ENV:
         assert name in message
+
+
+@pytest.mark.parametrize("flood_at", [None, 0, 2])
+async def test_live_send_pacing_and_flood_stop_offline(monkeypatch, flood_at):
+    harness = _load_live_module("conftest")
+    send_test = _load_live_module("test_live_send_gate")
+    clock = SimpleNamespace(now=1000.0)
+    send_starts = []
+    flood_call_count = 0
+
+    async def sleep(seconds):
+        clock.now += seconds
+
+    async def send_message(peer, text):
+        nonlocal flood_call_count
+        assert peer == "me"
+        index = len(send_starts)
+        send_starts.append(clock.now)
+        if index == flood_at:
+            flood_call_count = len(client.mock_calls)
+            raise FloodWaitError(request=None, capture=5)
+        # Completion gaps would be <0.95s despite correctly paced starts.
+        await sleep((0.8, 0.1, 0.65, 0.2, 0.05)[index])
+        return tl_types.Message(id=index + 1, peer_id=tl_types.PeerUser(42))
+
+    client = Mock(
+        connect=AsyncMock(),
+        is_user_authorized=AsyncMock(return_value=True),
+        get_me=AsyncMock(return_value=tl_types.User(id=42)),
+        send_message=AsyncMock(side_effect=send_message),
+        is_connected=Mock(return_value=True),
+        delete_messages=AsyncMock(),
+        disconnect=AsyncMock(),
+    )
+    constructor = Mock(return_value=client)
+    for name in policy.REQUIRED_ENV:
+        monkeypatch.setenv(name, "1")
+    monkeypatch.setattr(harness, "StringSession", Mock())
+    monkeypatch.setattr(harness, "TelegramClient", constructor)
+    monkeypatch.setattr(send_test, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(send_test, "asyncio", SimpleNamespace(sleep=sleep))
+    monkeypatch.setattr(send_test, "TelegramRateLimitGate", lambda: TelegramRateLimitGate(time_func=lambda: clock.now))
+
+    async with aclosing(harness.live_telegram.__wrapped__()) as fixture:
+        sandbox = await anext(fixture)
+        with pytest.raises(FloodWaitError) if flood_at is not None else nullcontext():
+            await send_test.test_gate_paces_sends_to_one_per_second(sandbox)
+
+    assert constructor.call_args.kwargs["flood_sleep_threshold"] == 0
+    client.disconnect.assert_awaited_once()
+    if flood_at is None:
+        assert send_starts == pytest.approx([1000.0, 1001.1, 1002.2, 1003.3, 1004.4])
+        client.delete_messages.assert_awaited_once_with("me", [1, 2, 3, 4, 5])
+    else:
+        assert len(send_starts) == flood_at + 1
+        client.delete_messages.assert_not_awaited()
+        assert client.mock_calls[flood_call_count:] == [call.disconnect()]

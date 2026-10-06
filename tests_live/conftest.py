@@ -77,6 +77,7 @@ async def live_telegram() -> AsyncIterator[LiveSandbox]:
         StringSession(os.environ["REAL_TG_SESSION"]),
         int(os.environ["REAL_TG_API_ID"]),
         os.environ["REAL_TG_API_HASH"],
+        flood_sleep_threshold=0,  # Surface short floods instead of silently sleeping/retrying.
     )
     await client.connect()
     try:

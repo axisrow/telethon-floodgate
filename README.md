@@ -142,6 +142,26 @@ storage-agnostic.
 - Atomic multi-slot reservations (`try_acquire(..., slots=n)`) are supported
   for compound operations.
 
+## Quota evidence
+
+Telegram does not publish a complete numeric FLOOD_WAIT table. The gate uses
+conservative guardrails from the sources below and keeps every value
+configurable.
+
+| Category | Configured guardrail | Evidence |
+| --- | --- | --- |
+| `history` (`messages.getHistory`) | 24 requests / 30s | A live probe reached FLOOD_WAIT on request 31 after 30 requests; the page size (1 vs 100) did not change the request threshold. Independent empirical notes report about 30 requests / 30s ([copy-history-bot-2](https://github.com/code29563/copy-history-bot-2#switching-between-clients-and-handling-floodwaits)). |
+| `send:user` | 1 / 1.1s | Community guidance is about one message per second to one private peer; the live Saved Messages test passed at about 1s, and the guardrail adds margin. |
+| `send:channel`, `send:chat` | 16 / 60s | Community guidance is about 20 messages per minute in one group/channel ([Telegram Limits](https://limits.tginfo.me/en)); the guardrail keeps a margin. |
+| account-wide `send` and other categories | Existing values | No repeatable public numeric quota was found for these method families; they remain internal conservative guardrails. |
+
+The history value limits each actual `GetHistoryRequest`. A consumer must
+call the gate for every page request, not once for an entire logical export.
+These values describe observed behavior for a method/account shape; they are
+not Telegram's universal quotas. Telegram's official error reference only
+defines `FLOOD_WAIT_X` as exceeding the allowed attempts for a method and its
+parameters ([API errors](https://core.telegram.org/api/errors#420-flood)).
+
 ## License
 
 MIT — see [LICENSE](LICENSE). Unofficial third-party library; not affiliated
@@ -159,14 +179,18 @@ are a separate, explicit activity, in four levels:
   account environment:
   ```bash
   export REAL_TG_API_ID=... REAL_TG_API_HASH=... REAL_TG_PHONE=... REAL_TG_SESSION=...
-  RUN_FLOODGATE_LIVE_TG=1 pytest tests_live -s
+  RUN_FLOODGATE_LIVE_TG=1 python -m pytest tests_live -x -v -s
   ```
   With the gate closed every test skips; with the gate open but the account
   env missing they fail loudly naming the variables. `test_live_peer_keys`
   (read-only) classifies every real `get_dialogs()` entity and fails on any
   UNKNOWN kind or malformed key; `test_live_send_gate` sends 5 messages to
-  Saved Messages through the real gate and proves the 1/s user-peer pacing
-  engages with no FloodWaitError.
+  Saved Messages through the real gate and proves the 1.1s user-peer pacing
+  engages with no FloodWaitError. Automatic flood sleeping is disabled, so
+  even short waits fail the run. Pacing is measured between send starts,
+  independently of response latency. Successful runs delete their probes;
+  on a flood the test stops without cleanup and prints the probe IDs to
+  delete after the reported wait. A cleanup failure also fails the test.
 - **Level 2 — calibration (manual):** `scripts/calibrate_send_limits.py`
   probes the raw boundary without our gate — fixed interval points, hard
   budgets (`--max-messages`, `--max-seconds`), auto-stop on the first flood
