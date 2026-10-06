@@ -5,21 +5,35 @@
 Adaptive flood backoff, gate observability, peer-pacing jitter.
 
 - `TelegramRateLimitGate.note_flood(phone, seconds)` — opt-in per-gate
-  adaptive backoff (`flood_backoff=True`): every reported FLOOD_WAIT doubles
-  the defers the gate hands out for that phone until the events decay
-  (1h default window, cap 8x by default, both configurable). The multiplier
-  scales category AND per-peer defers; zero defers stay zero — backoff slows
-  callers, it invents no refusals. Consumers wire it from their own flood
-  reporting (e.g. a `pool.report_flood` hook); the layers stay decoupled.
-  Unlike the docker-telethon-plus throttler this was ported from, bucket
-  waits are scaled too, not just inter-call gaps.
+  adaptive backoff (`flood_backoff=True`): every reported FLOOD_WAIT **above
+  the transient threshold (60s)** doubles the defers the gate hands out for
+  that phone until the events decay (1h default window, cap 8x, both
+  configurable; `flood_backoff_cap < 1` raises instead of silently
+  disabling). Routine ≤60s pacing floods — the sweep protocol working as
+  designed — do not escalate; `seconds=None` (severity unknown) counts
+  conservatively. The multiplier scales category AND per-peer defers; zero
+  defers stay zero — backoff slows callers, it invents no refusals.
+  Consumers wire it from their own flood reporting (e.g. a
+  `pool.report_flood` hook); the layers stay decoupled. Unlike the
+  docker-telethon-plus throttler this was ported from, bucket waits are
+  scaled too, not just inter-call gaps.
 - `TelegramRateLimitGate.snapshot(phone)` — live per-account state:
-  per-category usage and specs, per-peer buckets, current flood multiplier
-  and events-in-window. Feed for dashboards/health endpoints.
+  per-category usage and specs, per-peer buckets (incl. defer jitter), the
+  current flood multiplier and events-in-window. Event-loop-affine; feed
+  for dashboards/health endpoints.
+- `TelegramRateLimitGate(jitter_func=...)` — deterministic jitter injection
+  threading to every category and peer limiter (mirrors `time_func`).
+- `acquire()` sleeps a flood-multiplied defer in ≤30s slices
+  (`ACQUIRE_SLEEP_CAP_SEC`) and re-checks on every wake, so `reset()` keeps
+  working as the unblock escape hatch during long backoffs.
+- `reset()` scoping tightened: `reset(phone, category=...)` clears only that
+  category's peer buckets, and a category-scoped reset no longer wipes
+  per-phone flood events (they have no category dimension).
 - `SEND_PEER_USER_SPEC` gains 0.15s defer jitter so retried sends around the
   calibrated 1/1.1s boundary do not fire metronome-precisely (same lockstep
   rationale as `ResolveRateLimiter`'s jitter).
-- `ResolveRateLimiter.used(phone)` — current-window usage for observability.
+- `ResolveRateLimiter.used(phone)` — burst-window usage for observability;
+  read-only (an unknown phone seeds no window entry).
 
 ## 0.1.2 (2026-10-07)
 

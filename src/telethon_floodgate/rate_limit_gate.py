@@ -19,6 +19,7 @@ from typing import Any
 from telethon.requestiter import RequestIter
 from telethon.tl.functions import channels, messages
 
+from telethon_floodgate.flood_wait import TRANSIENT_FLOOD_WAIT_MAX_SEC
 from telethon_floodgate.rate_limiter import ResolveRateLimiter
 
 logger = logging.getLogger(__name__)
@@ -134,6 +135,12 @@ def _category_for_operation(operation: str) -> str:
 class TelegramRateLimitGate:
     """Registry of independent sliding-window buckets keyed by phone/category."""
 
+    # acquire() re-checks the gate at most this often while deferring: a
+    # flood-multiplied defer can reach many minutes, and sleeping it in one
+    # shot would make reset() — the standard unblock action — unable to wake
+    # the sleeper until the whole defer elapses.
+    ACQUIRE_SLEEP_CAP_SEC = 30.0
+
     DEFAULT_SPEC = RateLimitSpec(max_calls=1000, window_sec=60.0)
     # #1330 showed repeated getDialogs floods even with multi-minute pauses.
     # Keep this deliberately low until production logs calibrate the value.
@@ -177,10 +184,18 @@ class TelegramRateLimitGate:
         peer_limits: dict[str, RateLimitSpec] | None = None,
         peer_max_buckets: int = 4096,
         time_func: Callable[[], float] | None = None,
+        jitter_func: Callable[[float, float], float] | None = None,
         flood_backoff: bool = False,
         flood_backoff_cap: float = 8.0,
         flood_decay_sec: float = 3600.0,
     ) -> None:
+        if flood_backoff_cap < 1.0:
+            raise ValueError(
+                "flood_backoff_cap must be >= 1.0: a smaller cap silently "
+                "disables the backoff instead of tightening it"
+            )
+        if flood_decay_sec < 1.0:
+            raise ValueError("flood_decay_sec must be >= 1.0")
         specs = {
             "dialogs": self.DIALOGS_SPEC,
             "dialog_sweep": self.DIALOG_SWEEP_SPEC,
@@ -192,16 +207,23 @@ class TelegramRateLimitGate:
             "default": self.DEFAULT_SPEC,
         }
         specs.update(category_limits or {})
+        # One clock for the gate and every limiter: mixing an injected gate
+        # clock with limiter-side monotonic compares timestamps from two
+        # timelines and miscomputes defers — exactly under injected clocks.
+        self._time_func: Callable[[], float] = (
+            time_func if time_func is not None else time.monotonic
+        )
+        self._jitter_func = jitter_func  # None = limiter default (random.uniform)
         self._limiters = {
             category: ResolveRateLimiter(
                 max_calls=spec.max_calls,
                 window_sec=spec.window_sec,
                 jitter_sec=spec.jitter_sec,
-                **({"time_func": time_func} if time_func is not None else {}),
+                time_func=self._time_func,
+                **({"jitter_func": jitter_func} if jitter_func is not None else {}),
             )
             for category, spec in specs.items()
         }
-        self._time_func = time_func
         self._category_specs = dict(specs)
         # Adaptive backoff: every FLOOD_WAIT the consumer reports via
         # note_flood doubles the defers this gate hands out for that phone
@@ -209,8 +231,8 @@ class TelegramRateLimitGate:
         # calibration holds; a server-side flood is proof it currently does
         # not. Opt-in — it changes returned defers — like the sustained tier.
         self._flood_backoff = flood_backoff
-        self._flood_backoff_cap = max(1.0, float(flood_backoff_cap))
-        self._flood_decay_sec = max(1.0, float(flood_decay_sec))
+        self._flood_backoff_cap = float(flood_backoff_cap)
+        self._flood_decay_sec = float(flood_decay_sec)
         self._flood_events: dict[str, deque[float]] = defaultdict(deque)
         # Per-peer specs are keyed "<category>:<kind>" (e.g. "send:user"); the
         # kind prefix comes from the peer key built by telethon_floodgate.peer.
@@ -230,26 +252,30 @@ class TelegramRateLimitGate:
         # resolve is explicitly a no-op category: ResolveGuardMixin owns it.
         return _category_for_operation(operation)
 
-    def note_flood(self, phone: str, seconds: float = 0.0) -> float:
-        """Record a server-side FLOOD_WAIT; returns the new defer multiplier.
+    def note_flood(self, phone: str, seconds: float | None = None) -> float:
+        """Record a server-side FLOOD_WAIT; returns the current defer multiplier.
 
         The consumer wires this from its flood reporting (e.g. a
         ``pool.report_flood`` hook) — the gate never sees Telegram errors
-        itself. ``seconds`` is accepted for call-site symmetry, but only the
-        event *count* inside the decay window drives the multiplier: one long
-        wait and several short ones mean the same thing — the static
-        calibration is stale right now.
+        itself. Only waits above TRANSIENT_FLOOD_WAIT_MAX_SEC escalate: routine
+        ≤60s pacing floods are Telegram's sweep protocol working as designed
+        (see DIALOG_SWEEP_SPEC), while a blocking wait is proof the static
+        calibration is stale for this phone. ``seconds=None`` (severity
+        unknown) counts conservatively.
         """
         if not self._flood_backoff:
             return 1.0
-        self._flood_events[phone].append(self._now())
+        if seconds is not None and seconds <= TRANSIENT_FLOOD_WAIT_MAX_SEC:
+            return self._flood_multiplier(phone)
+        self._flood_events[phone].append(self._time_func())
         return self._flood_multiplier(phone)
 
     def snapshot(self, phone: str) -> dict[str, object]:
         """Live gate state for one account — dashboards/health endpoints.
 
-        Read-only view; pruning expired entries is the same bookkeeping the
-        next ``try_acquire`` would do anyway.
+        Event-loop-affine: prune-and-count mirrors the bookkeeping the next
+        ``try_acquire`` would do anyway, but the walk over peer buckets is
+        not thread-safe — call from the gate's loop, not a dashboard thread.
         """
         categories: dict[str, dict[str, object]] = {}
         for category, spec in self._category_specs.items():
@@ -260,7 +286,8 @@ class TelegramRateLimitGate:
                 "used": self._limiters[category].used(phone),
             }
         peers: dict[str, dict[str, object]] = {}
-        for bucket_phone, category, peer in self._peer_buckets:
+        for key, limiter in self._peer_buckets.items():
+            bucket_phone, category, peer = key
             if bucket_phone != phone:
                 continue
             spec = self._peer_spec_for(category, peer)
@@ -273,18 +300,20 @@ class TelegramRateLimitGate:
                 # multiplier scales it — a dashboard predicting defers from
                 # max_calls/window_sec alone would undershoot send:user.
                 "jitter_sec": spec.jitter_sec,
-                "used": self._peer_buckets[(bucket_phone, category, peer)].used(phone),
+                "used": limiter.used(phone),
             }
+        # Prune-then-count in one place: the multiplier call evicts decayed
+        # events, so the len() below is the true in-window count no matter
+        # how the dict literal is refactored.
+        flood_multiplier = self._flood_multiplier(phone)
+        flood_events = self._flood_events.get(phone)
         return {
             "flood_backoff": self._flood_backoff,
-            "flood_multiplier": self._flood_multiplier(phone),
-            "flood_events_in_window": len(self._flood_events.get(phone, ())),
+            "flood_multiplier": flood_multiplier,
+            "flood_events_in_window": len(flood_events) if flood_events else 0,
             "categories": categories,
             "peer_buckets": peers,
         }
-
-    def _now(self) -> float:
-        return self._time_func() if self._time_func is not None else time.monotonic()
 
     def _flood_multiplier(self, phone: str) -> float:
         if not self._flood_backoff:
@@ -292,10 +321,13 @@ class TelegramRateLimitGate:
         events = self._flood_events.get(phone)
         if not events:
             return 1.0
-        cutoff = self._now() - self._flood_decay_sec
+        cutoff = self._time_func() - self._flood_decay_sec
         while events and events[0] <= cutoff:
             events.popleft()
         if not events:
+            # Decay drained the phone's history — drop the key so long-dead
+            # accounts do not linger in state (only reset() would otherwise).
+            self._flood_events.pop(phone, None)
             return 1.0
         # Clamp the exponent before the pow: 2.0 ** 1024 overflows float and
         # would raise inside try_acquire — exactly during a flood storm. The
@@ -335,7 +367,7 @@ class TelegramRateLimitGate:
         """
         while (retry_after := self.try_acquire(phone, category)) > 0:
             logger.info("%s: rate-limit gate defers %.1fs", category, retry_after)
-            await sleep(retry_after)
+            await sleep(min(retry_after, self.ACQUIRE_SLEEP_CAP_SEC))
 
     def wrap_messages_iterator(
         self,
@@ -371,7 +403,11 @@ class TelegramRateLimitGate:
             if category is None:
                 self._flood_events.clear()
         else:
-            stale = [key for key in self._peer_buckets if key[0] == phone]
+            stale = [
+                key
+                for key in self._peer_buckets
+                if key[0] == phone and (category is None or key[1] == category)
+            ]
             for key in stale:
                 del self._peer_buckets[key]
             if category is None:
@@ -401,7 +437,12 @@ class TelegramRateLimitGate:
                 max_calls=spec.max_calls,
                 window_sec=spec.window_sec,
                 jitter_sec=spec.jitter_sec,
-                **({"time_func": self._time_func} if self._time_func is not None else {}),
+                time_func=self._time_func,
+                **(
+                    {"jitter_func": self._jitter_func}
+                    if self._jitter_func is not None
+                    else {}
+                ),
             )
             self._peer_buckets[key] = limiter
             while len(self._peer_buckets) > self._peer_max_buckets:

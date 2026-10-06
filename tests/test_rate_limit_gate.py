@@ -244,7 +244,10 @@ async def test_acquire_rechecks_after_early_wakeup_and_reserves() -> None:
         clock.now += seconds / 2 if len(sleeps) == 1 else seconds
 
     await gate.acquire("+1", "dialogs", sleep=sleep)
-    assert sleeps == [60.0, 30.0]
+    # The 60s defer is slept in capped 30s slices (ACQUIRE_SLEEP_CAP_SEC) —
+    # the last slice is the remainder — so a reset() mid-wait cannot strand
+    # the sleeper; every wake re-checks.
+    assert sleeps == [30.0, 30.0, 15.0]
     assert gate.try_acquire("+1", "dialogs") == 60.0
 
 
@@ -315,8 +318,22 @@ def test_flood_backoff_doubles_defers_after_note_flood() -> None:
     clock = _Clock()
     gate = _flooded_gate(clock)
     assert gate.try_acquire("+1", "send") == 0.0
-    assert gate.note_flood("+1", 30.0) == 2.0
+    assert gate.note_flood("+1", 90.0) == 2.0
     assert gate.try_acquire("+1", "send") == 120.0
+
+
+def test_transient_pacing_floods_do_not_escalate() -> None:
+    """≤60s waits are Telegram's pacing protocol, not a calibration failure.
+
+    Three routine 27-30s sweep floods must not silence the whole phone at
+    the 8x cap; only blocking waits (or unknown severity) escalate.
+    """
+    clock = _Clock()
+    gate = _flooded_gate(clock)
+    gate.try_acquire("+1", "send")
+    gate.note_flood("+1", 30.0)
+    assert gate.try_acquire("+1", "send") == 60.0
+    assert gate.note_flood("+1") == 2.0  # unknown severity counts conservatively
 
 
 def test_flood_backoff_is_opt_in() -> None:
@@ -326,17 +343,24 @@ def test_flood_backoff_is_opt_in() -> None:
         time_func=clock,
     )
     gate.try_acquire("+1", "send")
-    assert gate.note_flood("+1", 30.0) == 1.0
+    assert gate.note_flood("+1", 90.0) == 1.0
     assert gate.try_acquire("+1", "send") == 60.0
 
 
 def test_flood_backoff_escalates_and_caps() -> None:
     clock = _Clock()
     gate = TelegramRateLimitGate(flood_backoff=True, time_func=clock)
-    assert gate.note_flood("+1", 10.0) == 2.0
-    assert gate.note_flood("+1", 10.0) == 4.0
-    assert gate.note_flood("+1", 10.0) == 8.0
-    assert gate.note_flood("+1", 10.0) == 8.0  # capped at the default cap
+    assert gate.note_flood("+1", 90.0) == 2.0
+    assert gate.note_flood("+1", 90.0) == 4.0
+    assert gate.note_flood("+1", 90.0) == 8.0
+    assert gate.note_flood("+1", 90.0) == 8.0  # capped at the default cap
+
+
+def test_flood_backoff_validates_params() -> None:
+    with pytest.raises(ValueError):
+        TelegramRateLimitGate(flood_backoff=True, flood_backoff_cap=0.5)
+    with pytest.raises(ValueError):
+        TelegramRateLimitGate(flood_backoff=True, flood_decay_sec=0.0)
 
 
 def test_flood_backoff_survives_a_flood_storm() -> None:
@@ -350,7 +374,7 @@ def test_flood_backoff_survives_a_flood_storm() -> None:
     gate = _flooded_gate(clock)
     multiplier = 1.0
     for _ in range(1100):
-        multiplier = gate.note_flood("+1", 1.0)
+        multiplier = gate.note_flood("+1")  # severity unknown: counts
     assert multiplier == 8.0
     gate.try_acquire("+1", "send")
     assert gate.try_acquire("+1", "send") == 480.0
@@ -359,7 +383,7 @@ def test_flood_backoff_survives_a_flood_storm() -> None:
 def test_category_scoped_reset_keeps_flood_events() -> None:
     clock = _Clock()
     gate = _flooded_gate(clock)
-    gate.note_flood("+1", 30.0)
+    gate.note_flood("+1", 90.0)
     gate.reset(category="send")
     assert gate.snapshot("+1")["flood_multiplier"] == 2.0
     gate.reset()
@@ -373,7 +397,7 @@ def test_flood_backoff_scales_peer_defers_too() -> None:
         peer_limits={"send:user": RateLimitSpec(max_calls=1, window_sec=1.1)},
     )
     gate.try_acquire("+1", "send", peer="user:42")
-    gate.note_flood("+1", 30.0)
+    gate.note_flood("+1", 90.0)
     assert gate.try_acquire("+1", "send", peer="user:42") == pytest.approx(2.2)
 
 
@@ -382,7 +406,7 @@ def test_flood_backoff_is_per_phone() -> None:
     gate = _flooded_gate(clock)
     gate.try_acquire("+1", "send")
     gate.try_acquire("+2", "send")
-    gate.note_flood("+1", 30.0)
+    gate.note_flood("+1", 90.0)
     assert gate.try_acquire("+1", "send") == 120.0
     assert gate.try_acquire("+2", "send") == 60.0
 
@@ -390,7 +414,7 @@ def test_flood_backoff_is_per_phone() -> None:
 def test_flood_backoff_decays_after_the_window() -> None:
     clock = _Clock()
     gate = _flooded_gate(clock)
-    gate.note_flood("+1", 30.0)
+    gate.note_flood("+1", 90.0)
     clock.now += 3600.0
     assert gate.snapshot("+1")["flood_multiplier"] == 1.0
 
@@ -398,7 +422,7 @@ def test_flood_backoff_decays_after_the_window() -> None:
 def test_flood_backoff_leaves_zero_defers_at_zero() -> None:
     clock = _Clock()
     gate = _flooded_gate(clock)
-    gate.note_flood("+1", 30.0)
+    gate.note_flood("+1", 90.0)
     # A fresh window still admits: backoff lengthens defers, it invents
     # no refusals.
     assert gate.try_acquire("+1", "dialogs") == 0.0
@@ -407,13 +431,26 @@ def test_flood_backoff_leaves_zero_defers_at_zero() -> None:
 def test_reset_clears_flood_events_for_one_phone() -> None:
     clock = _Clock()
     gate = _flooded_gate(clock)
-    gate.note_flood("+1", 30.0)
-    gate.note_flood("+2", 30.0)
+    gate.note_flood("+1", 90.0)
+    gate.note_flood("+2", 90.0)
     gate.reset("+1")
     assert gate.snapshot("+1")["flood_multiplier"] == 1.0
     assert gate.snapshot("+2")["flood_multiplier"] == 2.0
     gate.reset()
     assert gate.snapshot("+2")["flood_multiplier"] == 1.0
+
+
+def test_reset_scopes_peer_buckets_to_the_category() -> None:
+    clock = _Clock()
+    gate = TelegramRateLimitGate(
+        peer_limits={"history:user": RateLimitSpec(max_calls=1, window_sec=60)},
+        time_func=clock,
+    )
+    gate.try_acquire("+1", "send", peer="user:42")
+    gate.try_acquire("+1", "history", peer="user:42")
+    gate.reset("+1", category="send")
+    assert gate.try_acquire("+1", "send", peer="user:42") == 0.0  # cleared
+    assert gate.try_acquire("+1", "history", peer="user:42") > 0.0  # untouched
 
 
 # --- snapshot ---------------------------------------------------------------

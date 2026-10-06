@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 pip install -e ".[dev]"            # dev install (local venv: .venv/)
 
-python -m pytest -q                # offline suite (tests/ only — 82 tests, never touches Telegram)
+python -m pytest -q                # offline suite (tests/ only — 122 tests, never touches Telegram)
 python -m pytest tests/test_peer.py -q          # single file
 python -m pytest tests/test_peer.py -k name -q  # single test
 
