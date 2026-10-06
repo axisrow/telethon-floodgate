@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 (unreleased)
+## 0.1.0 (2026-08-31)
 
 Initial release — 1:1 extraction of the flood stack from the tg_content_factory
 project, plus per-peer send limits.
@@ -14,7 +14,7 @@ project, plus per-peer send limits.
 - flood-wait helpers: `run_with_flood_wait`, `run_with_flood_wait_retry`,
   transient/blocking classification, sleep helpers, `FloodWaitInfo`
 
-## 0.1.1 (unreleased)
+## 0.1.1 (2026-10-07)
 
 Opt-in live-testing harness + sustained-volume tier for `ResolveRateLimiter`.
 
