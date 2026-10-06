@@ -153,24 +153,39 @@ class ResolveRateLimiter:
 
         now = self._time()
         window = self._prune(phone, now)
-        if len(window) + slots > self._max_calls:
-            # Wait until enough calls have expired for the whole atomic request,
-            # not merely until the oldest call leaves the window.
-            calls_to_expire = len(window) + slots - self._max_calls
-            retry_after = (window[calls_to_expire - 1] + self._window_sec) - now
-            if self._jitter_sec:
-                retry_after += self._jitter(0.0, self._jitter_sec)
-            return max(retry_after, 0.0)
+        burst_full = len(window) + slots > self._max_calls
 
+        # Sustained first: when BOTH windows are full, the sustained retry
+        # (~hours) is the honest defer — returning the ~60s burst retry here
+        # would wake every deferred caller one extra cycle per window
+        # (review finding on tg_content_factory#1498).
         sustained_window: deque[float] | None = None
+        sustained_retry: float | None = None
         if self._sustained_calls is not None:
             sustained_window = self._prune_window(
                 self._sustained_calls, phone, now, self._sustained_window_sec
             )
             if len(sustained_window) + slots > self._sustained_max_calls:
                 calls_to_expire = len(sustained_window) + slots - self._sustained_max_calls
-                retry = (sustained_window[calls_to_expire - 1] + self._sustained_window_sec) - now
-                return max(retry, 0.0)
+                sustained_retry = (
+                    sustained_window[calls_to_expire - 1] + self._sustained_window_sec
+                ) - now
+
+        if burst_full:
+            # Wait until enough calls have expired for the whole atomic request,
+            # not merely until the oldest call leaves the window.
+            calls_to_expire = len(window) + slots - self._max_calls
+            retry_after = (window[calls_to_expire - 1] + self._window_sec) - now
+            if sustained_retry is not None:
+                retry_after = max(retry_after, sustained_retry)
+            if self._jitter_sec:
+                retry_after += self._jitter(0.0, self._jitter_sec)
+            return max(retry_after, 0.0)
+        if sustained_retry is not None:
+            retry = sustained_retry
+            if self._jitter_sec:
+                retry += self._jitter(0.0, self._jitter_sec)
+            return max(retry, 0.0)
 
         window.extend([now] * slots)
         if sustained_window is not None:
