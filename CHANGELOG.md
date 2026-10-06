@@ -1,20 +1,27 @@
 # Changelog
 
-## 0.1.0 (2026-08-31)
+## 0.2.0 (unreleased)
 
-Initial release — 1:1 extraction of the flood stack from the tg_content_factory
-project, plus per-peer send limits.
+Adaptive flood backoff, gate observability, peer-pacing jitter.
 
-- `TelegramRateLimitGate`: proactive per-(phone, category) sliding windows
-  plus per-peer send buckets `(phone, category, peer)` — independent from the
-  category budget, with `peer_key()` extraction from Telethon entities
-  (`peer.py`) and `TelegramPeerRateLimitedError`
-- `FloodCircuitBreaker`: pybreaker-based suspension per (operation, phone)
-- `ResolveRateLimiter`: sliding-window limiter for `auth.resolveUsername`
-- flood-wait helpers: `run_with_flood_wait`, `run_with_flood_wait_retry`,
-  transient/blocking classification, sleep helpers, `FloodWaitInfo`
+- `TelegramRateLimitGate.note_flood(phone, seconds)` — opt-in per-gate
+  adaptive backoff (`flood_backoff=True`): every reported FLOOD_WAIT doubles
+  the defers the gate hands out for that phone until the events decay
+  (1h default window, cap 8x by default, both configurable). The multiplier
+  scales category AND per-peer defers; zero defers stay zero — backoff slows
+  callers, it invents no refusals. Consumers wire it from their own flood
+  reporting (e.g. a `pool.report_flood` hook); the layers stay decoupled.
+  Unlike the docker-telethon-plus throttler this was ported from, bucket
+  waits are scaled too, not just inter-call gaps.
+- `TelegramRateLimitGate.snapshot(phone)` — live per-account state:
+  per-category usage and specs, per-peer buckets, current flood multiplier
+  and events-in-window. Feed for dashboards/health endpoints.
+- `SEND_PEER_USER_SPEC` gains 0.15s defer jitter so retried sends around the
+  calibrated 1/1.1s boundary do not fire metronome-precisely (same lockstep
+  rationale as `ResolveRateLimiter`'s jitter).
+- `ResolveRateLimiter.used(phone)` — current-window usage for observability.
 
-## 0.1.2 (unreleased)
+## 0.1.2 (2026-10-07)
 
 Shared async pacing plus the opt-in live-testing harness.
 
@@ -58,3 +65,17 @@ Opt-in live-testing harness + sustained-volume tier for `ResolveRateLimiter`.
 - empirical quota guardrails: `history` 24 requests / 30s, user-peer sends
   1 / 1.1s, and channel/chat peer sends 16 / 60s, each with documented
   evidence and a conservative margin
+
+## 0.1.0 (2026-08-31)
+
+Initial release — 1:1 extraction of the flood stack from the tg_content_factory
+project, plus per-peer send limits.
+
+- `TelegramRateLimitGate`: proactive per-(phone, category) sliding windows
+  plus per-peer send buckets `(phone, category, peer)` — independent from the
+  category budget, with `peer_key()` extraction from Telethon entities
+  (`peer.py`) and `TelegramPeerRateLimitedError`
+- `FloodCircuitBreaker`: pybreaker-based suspension per (operation, phone)
+- `ResolveRateLimiter`: sliding-window limiter for `auth.resolveUsername`
+- flood-wait helpers: `run_with_flood_wait`, `run_with_flood_wait_retry`,
+  transient/blocking classification, sleep helpers, `FloodWaitInfo`

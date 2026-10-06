@@ -192,6 +192,10 @@ class ResolveRateLimiter:
             sustained_window.extend([now] * slots)
         return 0.0
 
+    def used(self, phone: str) -> int:
+        """Calls recorded inside the current window for ``phone`` (prunes first)."""
+        return len(self._prune(phone, self._time()))
+
     def reset(self, phone: str | None = None) -> None:
         """Drop recorded history for ``phone`` (or all accounts)."""
         if phone is None:

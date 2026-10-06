@@ -22,7 +22,7 @@ import pytest
 from telethon.errors import FloodWaitError
 from telethon.tl import types as tl_types
 
-from telethon_floodgate import TelegramRateLimitGate
+from telethon_floodgate import RateLimitSpec, TelegramRateLimitGate
 
 ROOT = Path(__file__).resolve().parents[1]
 # A literal assignment to a REAL_TG_* name (only env READS are allowed).
@@ -170,7 +170,16 @@ async def test_live_send_pacing_and_flood_stop_offline(monkeypatch, flood_at):
     monkeypatch.setattr(harness, "TelegramClient", constructor)
     monkeypatch.setattr(send_test, "time", SimpleNamespace(monotonic=lambda: clock.now))
     monkeypatch.setattr(send_test, "asyncio", SimpleNamespace(sleep=sleep))
-    monkeypatch.setattr(send_test, "TelegramRateLimitGate", lambda: TelegramRateLimitGate(time_func=lambda: clock.now))
+    # Jitter-free send:user spec: this regression asserts the exact 1.1s
+    # pacing math; the default 0.15s defer jitter is covered by the gate tests.
+    monkeypatch.setattr(
+        send_test,
+        "TelegramRateLimitGate",
+        lambda: TelegramRateLimitGate(
+            time_func=lambda: clock.now,
+            peer_limits={"send:user": RateLimitSpec(max_calls=1, window_sec=1.1)},
+        ),
+    )
 
     async with aclosing(harness.live_telegram.__wrapped__()) as fixture:
         sandbox = await anext(fixture)

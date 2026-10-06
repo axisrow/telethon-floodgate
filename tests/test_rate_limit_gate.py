@@ -296,3 +296,134 @@ async def test_cancelling_acquire_does_not_reserve_or_block_others() -> None:
         await task
     clock.now += 60
     assert gate.try_acquire("+1", "dialogs") == 0.0
+
+
+# --- adaptive flood backoff -------------------------------------------------
+
+
+def _flooded_gate(clock: _Clock, **kwargs: object) -> TelegramRateLimitGate:
+    options: dict = {
+        "category_limits": {"send": RateLimitSpec(max_calls=1, window_sec=60)},
+        "flood_backoff": True,
+        "time_func": clock,
+    }
+    options.update(kwargs)
+    return TelegramRateLimitGate(**options)
+
+
+def test_flood_backoff_doubles_defers_after_note_flood() -> None:
+    clock = _Clock()
+    gate = _flooded_gate(clock)
+    assert gate.try_acquire("+1", "send") == 0.0
+    assert gate.note_flood("+1", 30.0) == 2.0
+    assert gate.try_acquire("+1", "send") == 120.0
+
+
+def test_flood_backoff_is_opt_in() -> None:
+    clock = _Clock()
+    gate = TelegramRateLimitGate(
+        category_limits={"send": RateLimitSpec(max_calls=1, window_sec=60)},
+        time_func=clock,
+    )
+    gate.try_acquire("+1", "send")
+    assert gate.note_flood("+1", 30.0) == 1.0
+    assert gate.try_acquire("+1", "send") == 60.0
+
+
+def test_flood_backoff_escalates_and_caps() -> None:
+    clock = _Clock()
+    gate = TelegramRateLimitGate(flood_backoff=True, time_func=clock)
+    assert gate.note_flood("+1", 10.0) == 2.0
+    assert gate.note_flood("+1", 10.0) == 4.0
+    assert gate.note_flood("+1", 10.0) == 8.0
+    assert gate.note_flood("+1", 10.0) == 8.0  # capped at the default cap
+
+
+def test_flood_backoff_scales_peer_defers_too() -> None:
+    clock = _Clock()
+    gate = _flooded_gate(
+        clock,
+        peer_limits={"send:user": RateLimitSpec(max_calls=1, window_sec=1.1)},
+    )
+    gate.try_acquire("+1", "send", peer="user:42")
+    gate.note_flood("+1", 30.0)
+    assert gate.try_acquire("+1", "send", peer="user:42") == pytest.approx(2.2)
+
+
+def test_flood_backoff_is_per_phone() -> None:
+    clock = _Clock()
+    gate = _flooded_gate(clock)
+    gate.try_acquire("+1", "send")
+    gate.try_acquire("+2", "send")
+    gate.note_flood("+1", 30.0)
+    assert gate.try_acquire("+1", "send") == 120.0
+    assert gate.try_acquire("+2", "send") == 60.0
+
+
+def test_flood_backoff_decays_after_the_window() -> None:
+    clock = _Clock()
+    gate = _flooded_gate(clock)
+    gate.note_flood("+1", 30.0)
+    clock.now += 3600.0
+    assert gate.snapshot("+1")["flood_multiplier"] == 1.0
+
+
+def test_flood_backoff_leaves_zero_defers_at_zero() -> None:
+    clock = _Clock()
+    gate = _flooded_gate(clock)
+    gate.note_flood("+1", 30.0)
+    # A fresh window still admits: backoff lengthens defers, it invents
+    # no refusals.
+    assert gate.try_acquire("+1", "dialogs") == 0.0
+
+
+def test_reset_clears_flood_events_for_one_phone() -> None:
+    clock = _Clock()
+    gate = _flooded_gate(clock)
+    gate.note_flood("+1", 30.0)
+    gate.note_flood("+2", 30.0)
+    gate.reset("+1")
+    assert gate.snapshot("+1")["flood_multiplier"] == 1.0
+    assert gate.snapshot("+2")["flood_multiplier"] == 2.0
+    gate.reset()
+    assert gate.snapshot("+2")["flood_multiplier"] == 1.0
+
+
+# --- snapshot ---------------------------------------------------------------
+
+
+def test_snapshot_reports_category_and_peer_usage() -> None:
+    clock = _Clock()
+    gate = TelegramRateLimitGate(time_func=clock)
+    gate.try_acquire("+1", "history")
+    gate.try_acquire("+1", "send", peer="user:42")
+
+    snap = gate.snapshot("+1")
+
+    assert snap["flood_backoff"] is False
+    assert snap["flood_multiplier"] == 1.0
+    assert snap["categories"]["history"] == {
+        "max_calls": 24,
+        "window_sec": 30.0,
+        "jitter_sec": 0.0,
+        "used": 1,
+    }
+    assert snap["categories"]["send"]["used"] == 1
+    assert snap["peer_buckets"] == {
+        "send:user:42": {"max_calls": 1, "window_sec": 1.1, "used": 1},
+    }
+
+
+def test_snapshot_scopes_to_one_phone() -> None:
+    clock = _Clock()
+    gate = TelegramRateLimitGate(time_func=clock)
+    gate.try_acquire("+1", "history")
+
+    snap = gate.snapshot("+2")
+
+    assert snap["categories"]["history"]["used"] == 0
+    assert snap["peer_buckets"] == {}
+
+
+def test_peer_user_spec_jitters_by_default() -> None:
+    assert TelegramRateLimitGate.SEND_PEER_USER_SPEC.jitter_sec == 0.15
