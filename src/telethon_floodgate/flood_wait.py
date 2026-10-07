@@ -4,12 +4,19 @@ import asyncio
 import logging
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
-from typing import Any, Awaitable, TypeVar
+from typing import Any, Awaitable, Protocol, TypeVar
 
 from pydantic import BaseModel
 from telethon.errors import FloodWaitError
 
 from telethon_floodgate._datetime import try_parse_utc_datetime
+
+
+class FloodReportingGate(Protocol):
+    """Structural slice of TelegramRateLimitGate the flood helpers need."""
+
+    def note_flood(self, phone: str, seconds: float | None = None) -> float: ...
+
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +105,7 @@ async def handle_flood_wait(
     operation: str,
     phone: str | None = None,
     pool: Any | None = None,
+    gate: FloodReportingGate | None = None,
     logger_: logging.Logger | None = None,
 ) -> FloodWaitInfo:
     wait_seconds = coerce_flood_wait_seconds(getattr(exc, "seconds", 0))
@@ -112,6 +120,15 @@ async def handle_flood_wait(
         reporter = getattr(pool, "report_flood", None)
         if callable(reporter):
             await reporter(phone, wait_seconds)
+
+    # Close the adaptive-backoff loop: the gate never sees Telegram errors,
+    # so the flood reporting is what tells it the static calibration drifted.
+    # note_flood itself ignores routine ≤60s pacing floods.
+    if gate is not None and phone:
+        multiplier = gate.note_flood(phone, wait_seconds)
+        logger.debug(
+            "%s: gate backoff multiplier now %.1fx for %s", operation, multiplier, phone
+        )
 
     active_logger = logger_ or logger
     if is_transient_flood_wait_seconds(wait_seconds):
@@ -169,6 +186,7 @@ async def run_with_flood_wait(
     operation: str,
     phone: str | None = None,
     pool: Any | None = None,
+    gate: FloodReportingGate | None = None,
     logger_: logging.Logger | None = None,
     timeout: float | None = None,
 ) -> T:
@@ -182,6 +200,7 @@ async def run_with_flood_wait(
             operation=operation,
             phone=phone,
             pool=pool,
+            gate=gate,
             logger_=logger_,
         )
         raise HandledFloodWaitError(info) from exc
@@ -193,6 +212,7 @@ async def run_with_flood_wait_retry(
     operation: str,
     phone: str | None = None,
     pool: Any | None = None,
+    gate: FloodReportingGate | None = None,
     logger_: logging.Logger | None = None,
     timeout: float | None = None,
     transient_wait_max_sec: int = TRANSIENT_FLOOD_WAIT_MAX_SEC,
@@ -206,6 +226,7 @@ async def run_with_flood_wait_retry(
                 operation=operation,
                 phone=phone,
                 pool=pool,
+                gate=gate,
                 logger_=logger_,
                 timeout=timeout,
             )
