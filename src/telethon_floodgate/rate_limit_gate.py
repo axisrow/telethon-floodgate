@@ -14,6 +14,7 @@ import time
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
+from math import isfinite
 from typing import Any
 
 from telethon.requestiter import RequestIter
@@ -265,6 +266,15 @@ class TelegramRateLimitGate:
             key: replace(spec, jitter_sec=_effective_jitter(spec))
             for key, spec in self._peer_specs.items()
         }
+        for key, spec in self._peer_specs.items():
+            if not (isfinite(spec.window_sec) and spec.window_sec > 0):
+                # Fail here like category specs do (their limiters are built
+                # in __init__): surfacing a degenerate peer window at request
+                # time would raise from inside try_acquire and break its
+                # never-raises contract.
+                raise ValueError(
+                    f"peer spec {key!r}: window_sec must be finite and > 0"
+                )
         self._peer_max_buckets = max(1, int(peer_max_buckets))
         self._peer_buckets: OrderedDict[tuple[str, str, str], ResolveRateLimiter] = OrderedDict()
 
@@ -412,27 +422,44 @@ class TelegramRateLimitGate:
         iterator.client = _MessageGateClient(client, self, phone, sleep)
         return iterator
 
-    def reset(self, phone: str | None = None, category: str | None = None) -> None:
-        limiters = self._limiters.values() if category is None else [self._limiters[category]]
-        for limiter in limiters:
-            limiter.reset(phone)
-        if phone is None:
+    def _drop_peer_buckets(self, phone: str | None, category: str | None) -> None:
+        if phone is None and category is None:
             self._peer_buckets.clear()
-            # Flood events have no category dimension — only a full reset
-            # may wipe them; a category-scoped reset would otherwise drop
+            return
+        stale = [
+            key
+            for key in self._peer_buckets
+            if (phone is None or key[0] == phone)
+            and (category is None or key[1] == category)
+        ]
+        for key in stale:
+            del self._peer_buckets[key]
+
+    def reset(self, phone: str | None = None, category: str | None = None) -> None:
+        if category is None:
+            for limiter in self._limiters.values():
+                limiter.reset(phone)
+            # Flood events have no category dimension — they follow the full
+            # or per-phone reset only; a category-scoped reset must not drop
             # every account's accumulated backoff as a side effect.
-            if category is None:
+            if phone is None:
                 self._flood_events.clear()
-        else:
-            stale = [
-                key
-                for key in self._peer_buckets
-                if key[0] == phone and (category is None or key[1] == category)
-            ]
-            for key in stale:
-                del self._peer_buckets[key]
-            if category is None:
+            else:
                 self._flood_events.pop(phone, None)
+        else:
+            # "send_peer" is what TelegramPeerRateLimitedError carries as its
+            # category, but the buckets it refuses live under "send": map the
+            # endorsed unblock reset(err.phone, category=err.category) onto
+            # the real category instead of silently matching nothing.
+            if category == "send_peer":
+                category = "send"
+            # Unknown/no-op categories ("resolve", "reaction", typos) own no
+            # bucket here: a no-op beats a KeyError on the consumer's unblock
+            # path.
+            limiter = self._limiters.get(category)
+            if limiter is not None:
+                limiter.reset(phone)
+        self._drop_peer_buckets(phone, category)
 
     def _peer_spec_for(self, category: str, peer: str) -> RateLimitSpec | None:
         kind = peer.split(":", 1)[0] if ":" in peer else ""

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
+from math import ceil
 from typing import Any, Awaitable, Protocol, TypeVar
 
 from pydantic import BaseModel
@@ -68,7 +70,10 @@ def flood_wait_remaining_seconds(value: object, *, now: datetime | None = None) 
     if flood_until is None:
         return None
     now = now or datetime.now(timezone.utc)
-    return max(0, int((flood_until - now).total_seconds()))
+    # ceil, not truncate: a flood expiring in 0.6s must stay classified
+    # (remaining=1 -> transient); truncation collapses it to 0, which is
+    # neither transient nor blocking and leaves the caller no branch.
+    return max(0, ceil((flood_until - now).total_seconds()))
 
 
 def is_transient_flood_wait_until(
@@ -125,7 +130,12 @@ async def handle_flood_wait(
     if pool is not None and phone:
         reporter = getattr(pool, "report_flood", None)
         if callable(reporter):
-            await reporter(phone, wait_seconds)
+            # The pool object belongs to the consumer: sync hooks are just as
+            # legitimate — awaiting their None result used to crash flood
+            # handling with TypeError instead of absorbing the flood.
+            reported = reporter(phone, wait_seconds)
+            if inspect.isawaitable(reported):
+                await reported
 
     active_logger = logger_ or logger
 
@@ -248,7 +258,15 @@ async def run_with_flood_wait_retry(
                 max_seconds=transient_wait_max_sec,
             ):
                 raise
-            if waited_seconds + wait_seconds > transient_wait_budget_sec:
+            # Count what a retry actually sleeps — the wait plus the buffer;
+            # counting the bare wait let n retries overshoot the documented
+            # budget by up to n seconds.
+            if (
+                waited_seconds + wait_seconds + FLOOD_WAIT_RETRY_BUFFER_SEC
+                > transient_wait_budget_sec
+            ):
                 raise
             await sleep_for_handled_flood_wait(exc.info, logger_=logger_)
-            waited_seconds += wait_seconds
+            # Accumulate what the retry actually cost (wait + buffer) —
+            # accounting bare waits still let n retries overshoot by n-1.
+            waited_seconds += wait_seconds + FLOOD_WAIT_RETRY_BUFFER_SEC

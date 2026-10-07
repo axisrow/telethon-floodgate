@@ -1,6 +1,8 @@
 """Unit tests for the per-account resolve_username rate limiter (#551)."""
 from __future__ import annotations
 
+import pytest
+
 from telethon_floodgate.rate_limiter import ResolveRateLimiter
 
 
@@ -198,8 +200,6 @@ def test_sustained_tier_is_per_account():
 
 
 def test_sustained_params_must_come_in_pair():
-    import pytest
-
     with pytest.raises(ValueError):
         ResolveRateLimiter(sustained_max_calls=60)
     with pytest.raises(ValueError):
@@ -207,8 +207,6 @@ def test_sustained_params_must_come_in_pair():
 
 
 def test_sustained_window_cannot_be_narrower_than_burst():
-    import pytest
-
     with pytest.raises(ValueError):
         ResolveRateLimiter(sustained_max_calls=60, sustained_window_sec=30.0)
 
@@ -221,3 +219,15 @@ def test_reset_clears_sustained_window():
     assert limiter.try_acquire("+1") > 0.0
     limiter.reset("+1")
     assert limiter.try_acquire("+1") == 0.0
+
+
+def test_slots_above_sustained_max_raise_instead_of_indexerror():
+    limiter = _tiered(_TieredFakeClock(), sustained_calls=5)
+    with pytest.raises(ValueError, match="sustained_max_calls"):
+        limiter.try_acquire_many("+1", 6)
+
+
+def test_non_positive_window_is_rejected():
+    """A non-positive window prunes every entry instantly: a silent no-op."""
+    with pytest.raises(ValueError, match="window_sec"):
+        ResolveRateLimiter(max_calls=1, window_sec=0)

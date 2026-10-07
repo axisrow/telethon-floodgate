@@ -204,3 +204,56 @@ def test_reset_clears_state():
     breaker.check(OP, PHONE)
 
 
+def test_late_flood_report_does_not_extend_a_running_cooldown():
+    """One cooldown per trip: a report from a call already in flight when the
+    breaker opened must not push the trial further away — a whole swarm of
+    late reports would otherwise hold the pair closed for multiple cooldowns
+    without new evidence of degradation."""
+    clock = _Clock()
+    breaker = _breaker(clock, threshold=1)
+    breaker.record_flood(OP, PHONE)  # opens at t=1000, until t=1300
+
+    clock.advance(295.0)  # t=1295: 5s left
+    breaker.record_flood(OP, PHONE)  # late report — must not re-arm
+
+    with pytest.raises(TelegramOperationSuspendedError) as exc:
+        breaker.check(OP, PHONE)
+    assert exc.value.retry_after_sec == pytest.approx(5.0)
+
+
+def test_flood_after_an_expired_deadline_starts_a_fresh_cooldown():
+    """New evidence after the deadline ran out (and no check() in between)
+    still counts: a fresh cooldown is armed for the fresh flood."""
+    clock = _Clock()
+    breaker = _breaker(clock, threshold=1)
+    breaker.record_flood(OP, PHONE)
+    clock.advance(295.0)
+    breaker.record_flood(OP, PHONE)  # inside the running cooldown — ignored
+
+    clock.advance(105.0)  # t=1400: deadline (1300) long past
+    breaker.record_flood(OP, PHONE)  # genuine new flood
+    with pytest.raises(TelegramOperationSuspendedError) as exc:
+        breaker.check(OP, PHONE)
+    assert exc.value.retry_after_sec == pytest.approx(300.0)
+
+
+def test_stale_report_during_a_trial_cannot_overrule_its_success():
+    """A stale report from a call already in flight before the breaker opened
+    may re-trip the breaker mid-trial; the trial's success must still lift the
+    suspension — success is the fresher evidence, and without this the pair
+    would sit out a full extra cooldown despite a real success."""
+    clock = _Clock()
+    breaker = _breaker(clock, threshold=1)
+    breaker.record_flood(OP, PHONE)  # opens at t=1000, until t=1300
+    clock.advance(301.0)
+    breaker.check(OP, PHONE)  # trial granted
+
+    clock.advance(1.0)  # t=1302: stale pre-open report lands mid-trial
+    breaker.record_flood(OP, PHONE)  # re-trips and re-arms until t=1602
+
+    clock.advance(3.0)  # t=1305: the real trial succeeds
+    breaker.record_success(OP, PHONE)
+
+    breaker.check(OP, PHONE)  # must not raise for another 300s
+
+

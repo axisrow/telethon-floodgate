@@ -541,3 +541,56 @@ def test_category_jitter_is_per_category_configurable() -> None:
     )
     gate.try_acquire("+1", "dialogs")
     assert gate.try_acquire("+1", "dialogs") == 60.0
+
+
+def test_reset_scopes_peer_buckets_even_without_a_phone() -> None:
+    """reset(None, category=X) must not wipe other categories' peer buckets —
+    a category-scoped unblock used to silently disable per-peer pacing for
+    every account (the opposite of what 0.1.3 documented)."""
+    clock = _Clock()
+    gate = TelegramRateLimitGate(time_func=clock, jitter_func=_no_jitter)
+    gate.try_acquire("+1", "send", peer="user:42")
+
+    gate.reset(category="history")
+    assert "send:user:42" in gate.snapshot("+1")["peer_buckets"]
+    assert gate.try_acquire("+1", "send", peer="user:42") > 0.0  # pacing intact
+
+    gate.reset(category="send")
+    assert gate.try_acquire("+1", "send", peer="user:42") == 0.0  # cleared
+
+
+def test_reset_tolerates_noop_and_unknown_categories() -> None:
+    """resolve/reaction are no-op categories, "send_peer" is the category on
+    TelegramPeerRateLimitedError — reset() must absorb them, not KeyError."""
+    gate = TelegramRateLimitGate(time_func=_Clock())
+    gate.reset("+1", category="resolve")
+    gate.reset("+1", category="reaction")
+    gate.reset("+1", category="send_peer")
+    gate.reset(None, category="resolve")
+    gate.reset("+1", category="not_a_category")
+
+
+def test_reset_maps_send_peer_category_onto_send() -> None:
+    """TelegramPeerRateLimitedError carries category="send_peer" while the
+    refusing buckets live under "send": the endorsed unblock
+    reset(err.phone, category=err.category) must clear the bucket, not
+    silently match nothing."""
+    clock = _Clock()
+    gate = TelegramRateLimitGate(time_func=clock, jitter_func=_no_jitter)
+    gate.try_acquire("+1", "send", peer="user:42")
+    gate.try_acquire("+2", "send", peer="user:42")
+
+    gate.reset("+1", category="send_peer")
+
+    assert gate.try_acquire("+1", "send", peer="user:42") == 0.0  # cleared
+    assert gate.try_acquire("+2", "send", peer="user:42") > 0.0  # other phone intact
+
+
+def test_peer_specs_validate_window_at_construction() -> None:
+    """A degenerate peer window must fail at gate construction like category
+    specs do, not raise from inside try_acquire mid-flight (0.1.3 silently
+    disabled the pacer for such specs)."""
+    with pytest.raises(ValueError, match="send:user"):
+        TelegramRateLimitGate(
+            peer_limits={"send:user": RateLimitSpec(max_calls=1, window_sec=0.0)}
+        )
