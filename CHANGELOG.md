@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.1.4 (unreleased)
+
+Review-driven correctness fixes; no API changes.
+
+- `reset(category=...)` now honours its scope when no phone is given too: it
+  clears only that category's peer buckets (it used to wipe every account's
+  and every category's buckets — the opposite of what 0.1.3 documented), and
+  unknown/no-op categories (`resolve`, `reaction`, `send_peer`, typos) are a
+  no-op instead of `KeyError` on the consumer's unblock path.
+- `FloodCircuitBreaker.record_flood` no longer extends a running cooldown:
+  late reports from calls already in flight when the breaker opened (or
+  duplicate report paths) keep the original trial time; a flood arriving
+  after the deadline expired starts a fresh cooldown — one cooldown per trip.
+- `ResolveRateLimiter.try_acquire_many` raises the same `ValueError` as the
+  burst check when `slots` exceeds `sustained_max_calls` (it used to raise
+  `IndexError` from an empty sustained window).
+- `ResolveRateLimiter` rejects `window_sec <= 0` with `ValueError` — a
+  non-positive window silently disabled the limiter.
+- `flood_wait_remaining_seconds` ceils fractional remaining time: a flood
+  expiring in 0.6s now classifies as transient (remaining=1) instead of
+  collapsing to 0 — neither transient nor blocking.
+- `run_with_flood_wait_retry` counts the per-iteration sleep buffer in the
+  transient budget, so n retries can no longer overshoot
+  `transient_wait_budget_sec` by up to n seconds.
+- `handle_flood_wait` supports synchronous `report_flood` hooks (the result
+  is awaited only when awaitable) — a sync hook used to crash flood handling
+  with `TypeError`.
+- README: `sleep=` is documented for the gate helpers that actually accept it
+  (`acquire`, `wrap_messages_iterator`); the `run_with_flood_wait*` helpers
+  always use `asyncio.sleep`.
+
 ## 0.1.3 (2026-10-07)
 
 Adaptive flood backoff wired end-to-end, gate observability, jitter everywhere.

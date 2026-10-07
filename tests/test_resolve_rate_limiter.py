@@ -221,3 +221,19 @@ def test_reset_clears_sustained_window():
     assert limiter.try_acquire("+1") > 0.0
     limiter.reset("+1")
     assert limiter.try_acquire("+1") == 0.0
+
+
+def test_slots_above_sustained_max_raise_instead_of_indexerror():
+    import pytest
+
+    limiter = _tiered(_TieredFakeClock(), sustained_calls=5)
+    with pytest.raises(ValueError, match="sustained_max_calls"):
+        limiter.try_acquire_many("+1", 6)
+
+
+def test_non_positive_window_is_rejected():
+    """A non-positive window prunes every entry instantly: a silent no-op."""
+    import pytest
+
+    with pytest.raises(ValueError, match="window_sec"):
+        ResolveRateLimiter(max_calls=1, window_sec=0)

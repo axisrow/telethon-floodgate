@@ -191,8 +191,16 @@ class FloodCircuitBreaker:
             # breaker opening. Neither must reach the caller -- the real
             # FloodWaitError it is handling stays the exception that propagates.
             pass
-        if breaker.current_state == pybreaker.STATE_OPEN:
-            self._open_until[key] = self._time() + self._cooldown_seconds
+        now = self._time()
+        current = self._open_until.get(key)
+        # One cooldown per trip: reports from calls already in flight when the
+        # breaker opened (duplicate report paths included) land while the
+        # deadline still runs and must not extend it; a flood arriving after
+        # the deadline expired starts a fresh cooldown.
+        if breaker.current_state == pybreaker.STATE_OPEN and (
+            current is None or now >= current
+        ):
+            self._open_until[key] = now + self._cooldown_seconds
 
     def record_success(self, operation: str, phone: str | None) -> None:
         """Clear accumulated flood waits after a call went through."""

@@ -86,6 +86,11 @@ class ResolveRateLimiter:
     ) -> None:
         self._max_calls = max(1, int(max_calls))
         self._window_sec = float(window_sec)
+        if self._window_sec <= 0:
+            raise ValueError(
+                "window_sec must be > 0: a non-positive window prunes every "
+                "entry immediately and silently disables the limiter"
+            )
         self._jitter_sec = max(0.0, float(jitter_sec))
         self._time = time_func
         self._jitter = jitter_func
@@ -150,6 +155,10 @@ class ResolveRateLimiter:
             raise ValueError("slots must be at least 1")
         if slots > self._max_calls:
             raise ValueError("slots cannot exceed max_calls")
+        if self._sustained_calls is not None and slots > self._sustained_max_calls:
+            # Same contract as the burst check: without it, slots above the
+            # sustained cap indexed an empty window and raised IndexError.
+            raise ValueError("slots cannot exceed sustained_max_calls")
 
         now = self._time()
         window = self._prune(phone, now)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -7,10 +9,12 @@ from telethon.errors import FloodWaitError
 
 from telethon_floodgate.flood_wait import (
     HandledFloodWaitError,
+    flood_wait_remaining_seconds,
     format_flood_wait_detail,
     handle_flood_wait,
     is_blocking_flood_wait_until,
     is_transient_flood_wait_seconds,
+    is_transient_flood_wait_until,
     run_with_flood_wait,
     run_with_flood_wait_retry,
 )
@@ -265,3 +269,59 @@ async def test_run_with_flood_wait_retry_waits_for_transient_flood(monkeypatch):
     pool.report_flood.assert_awaited_once_with("+7000", 3)
     # The flooded round was reported to the gate; the clean retry was not.
     assert gate.calls == [("+7000", 3)]
+
+
+def test_subsecond_flood_wait_stays_classified():
+    """A flood expiring in 0.6s must classify as transient (remaining=1):
+    truncated to 0 it is neither transient nor blocking and the caller has
+    no branch to take."""
+    now = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    until = now + timedelta(seconds=0.6)
+
+    assert flood_wait_remaining_seconds(until, now=now) == 1
+    assert is_transient_flood_wait_until(until, now=now)
+    assert not is_blocking_flood_wait_until(until, now=now)
+
+
+async def test_handle_flood_wait_supports_sync_report_hooks():
+    """A plain-function report hook must not crash flood handling with
+    TypeError — the handler's whole job is absorbing the flood."""
+    err = FloodWaitError(request=None, capture=0)
+    err.seconds = 10
+    reported: list[tuple[str, int]] = []
+    pool = SimpleNamespace(
+        report_flood=lambda phone, seconds: reported.append((phone, seconds))
+    )
+
+    info = await handle_flood_wait(err, operation="op", phone="+7000", pool=pool)
+
+    assert reported == [("+7000", 10)]
+    assert info.wait_seconds == 10
+
+
+async def test_retry_budget_counts_the_sleep_buffer(monkeypatch):
+    """Budget accounting includes the per-iteration buffer: two 60s waits at
+    budget 120 used to sleep 122s; now the second retry is rejected."""
+    err = FloodWaitError(request=None, capture=0)
+    err.seconds = 60
+    calls = {"count": 0}
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("telethon_floodgate.flood_wait.asyncio.sleep", fake_sleep)
+
+    async def _call():
+        calls["count"] += 1
+        raise err
+
+    with pytest.raises(HandledFloodWaitError):
+        await run_with_flood_wait_retry(
+            _call,
+            operation="op",
+            transient_wait_budget_sec=120,
+        )
+
+    assert sleeps == [61.0]
+    assert calls["count"] == 2

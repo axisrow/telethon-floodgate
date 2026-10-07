@@ -61,7 +61,7 @@ from telethon_floodgate.rate_limiter import (
 )
 from telethon_floodgate.token_bucket import TokenBucket
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 __all__ = [
     "DEFAULT_COOLDOWN_SECONDS",

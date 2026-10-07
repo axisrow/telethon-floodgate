@@ -412,26 +412,35 @@ class TelegramRateLimitGate:
         iterator.client = _MessageGateClient(client, self, phone, sleep)
         return iterator
 
+    def _drop_peer_buckets(self, phone: str | None, category: str | None) -> None:
+        stale = [
+            key
+            for key in self._peer_buckets
+            if (phone is None or key[0] == phone)
+            and (category is None or key[1] == category)
+        ]
+        for key in stale:
+            del self._peer_buckets[key]
+
     def reset(self, phone: str | None = None, category: str | None = None) -> None:
-        limiters = self._limiters.values() if category is None else [self._limiters[category]]
-        for limiter in limiters:
-            limiter.reset(phone)
-        if phone is None:
-            self._peer_buckets.clear()
-            # Flood events have no category dimension — only a full reset
-            # may wipe them; a category-scoped reset would otherwise drop
-            # every account's accumulated backoff as a side effect.
-            if category is None:
-                self._flood_events.clear()
+        if category is None:
+            for limiter in self._limiters.values():
+                limiter.reset(phone)
         else:
-            stale = [
-                key
-                for key in self._peer_buckets
-                if key[0] == phone and (category is None or key[1] == category)
-            ]
-            for key in stale:
-                del self._peer_buckets[key]
-            if category is None:
+            # Unknown/no-op categories ("resolve", "reaction", "send_peer",
+            # typos) own no bucket here: a no-op beats a KeyError on the
+            # consumer's unblock path (reset(err.phone, category=err.category)).
+            limiter = self._limiters.get(category)
+            if limiter is not None:
+                limiter.reset(phone)
+        self._drop_peer_buckets(phone, category)
+        if category is None:
+            # Flood events have no category dimension — they follow the full
+            # or per-phone reset only; a category-scoped reset must not drop
+            # every account's accumulated backoff as a side effect.
+            if phone is None:
+                self._flood_events.clear()
+            else:
                 self._flood_events.pop(phone, None)
 
     def _peer_spec_for(self, category: str, peer: str) -> RateLimitSpec | None:

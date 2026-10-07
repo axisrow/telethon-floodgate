@@ -204,3 +204,36 @@ def test_reset_clears_state():
     breaker.check(OP, PHONE)
 
 
+def test_late_flood_report_does_not_extend_a_running_cooldown():
+    """One cooldown per trip: a report from a call already in flight when the
+    breaker opened must not push the trial further away — a whole swarm of
+    late reports would otherwise hold the pair closed for multiple cooldowns
+    without new evidence of degradation."""
+    clock = _Clock()
+    breaker = _breaker(clock, threshold=1)
+    breaker.record_flood(OP, PHONE)  # opens at t=1000, until t=1300
+
+    clock.advance(295.0)  # t=1295: 5s left
+    breaker.record_flood(OP, PHONE)  # late report — must not re-arm
+
+    with pytest.raises(TelegramOperationSuspendedError) as exc:
+        breaker.check(OP, PHONE)
+    assert exc.value.retry_after_sec == pytest.approx(5.0)
+
+
+def test_flood_after_an_expired_deadline_starts_a_fresh_cooldown():
+    """New evidence after the deadline ran out (and no check() in between)
+    still counts: a fresh cooldown is armed for the fresh flood."""
+    clock = _Clock()
+    breaker = _breaker(clock, threshold=1)
+    breaker.record_flood(OP, PHONE)
+    clock.advance(295.0)
+    breaker.record_flood(OP, PHONE)  # inside the running cooldown — ignored
+
+    clock.advance(105.0)  # t=1400: deadline (1300) long past
+    breaker.record_flood(OP, PHONE)  # genuine new flood
+    with pytest.raises(TelegramOperationSuspendedError) as exc:
+        breaker.check(OP, PHONE)
+    assert exc.value.retry_after_sec == pytest.approx(300.0)
+
+

@@ -82,9 +82,10 @@ client unchanged and passes unrelated requests through. It requires a fresh
 Telethon-style iterator with a writable, callable `client`; unsupported or
 already wrapped iterators fail explicitly. Recreate it inside the retry factory.
 
-These async helpers accept `sleep=`; pair it with the gate's `time_func=` in
-offline tests. They do not enable per-peer limiting: use `try_acquire` for
-per-peer or compound reservations.
+`gate.acquire` and `gate.wrap_messages_iterator` accept `sleep=` — pair it
+with the gate's `time_func=` in offline tests; the `run_with_flood_wait*`
+helpers always use `asyncio.sleep`. None of these enable per-peer limiting:
+use `try_acquire` for per-peer or compound reservations.
 
 `TokenBucket(rate_per_min, burst=1, clock=..., sleep=...)` provides a separate
 smooth-refill outgoing cap. `await bucket.acquire()` waits in a fair queue and
