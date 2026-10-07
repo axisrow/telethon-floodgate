@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.3 (unreleased)
+## 0.1.3 (2026-10-07)
 
 Adaptive flood backoff wired end-to-end, gate observability, jitter everywhere.
 
