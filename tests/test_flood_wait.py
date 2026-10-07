@@ -325,3 +325,43 @@ async def test_retry_budget_counts_the_sleep_buffer(monkeypatch):
 
     assert sleeps == [61.0]
     assert calls["count"] == 2
+
+
+async def test_retry_budget_limits_total_actual_sleep(monkeypatch):
+    """Accounting accumulates wait+buffer per retry: budget 10 with 3s waits
+    admits two retries (8s actually slept) and rejects the third — total
+    actual sleep can no longer exceed the documented budget."""
+    err = FloodWaitError(request=None, capture=0)
+    err.seconds = 3
+    calls = {"count": 0}
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("telethon_floodgate.flood_wait.asyncio.sleep", fake_sleep)
+
+    async def _call():
+        calls["count"] += 1
+        raise err
+
+    with pytest.raises(HandledFloodWaitError):
+        await run_with_flood_wait_retry(
+            _call,
+            operation="op",
+            transient_wait_budget_sec=10,
+        )
+
+    assert sleeps == [4.0, 4.0]
+    assert calls["count"] == 3
+
+
+def test_fractional_wait_above_transient_max_is_blocking():
+    """ceil keeps the until-classifiers consistent with the ≤60s policy: a
+    60.4s remainder was truncated to transient before; it is blocking now —
+    pinned so the band is a documented choice, not an accident."""
+    now = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    until = now + timedelta(seconds=60.4)
+
+    assert not is_transient_flood_wait_until(until, now=now)
+    assert is_blocking_flood_wait_until(until, now=now)

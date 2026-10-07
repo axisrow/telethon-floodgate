@@ -7,12 +7,25 @@ Review-driven correctness fixes; no API changes.
 - `reset(category=...)` now honours its scope when no phone is given too: it
   clears only that category's peer buckets (it used to wipe every account's
   and every category's buckets — the opposite of what 0.1.3 documented), and
-  unknown/no-op categories (`resolve`, `reaction`, `send_peer`, typos) are a
-  no-op instead of `KeyError` on the consumer's unblock path.
-- `FloodCircuitBreaker.record_flood` no longer extends a running cooldown:
-  late reports from calls already in flight when the breaker opened (or
-  duplicate report paths) keep the original trial time; a flood arriving
-  after the deadline expired starts a fresh cooldown — one cooldown per trip.
+  unknown/no-op categories (`resolve`, `reaction`, typos) are a no-op instead
+  of `KeyError` on the consumer's unblock path.
+- `reset(phone, category="send_peer")` maps onto `send`: the category
+  `TelegramPeerRateLimitedError` carries now clears the refusing bucket via
+  the endorsed unblock call instead of silently matching nothing.
+- Peer specs validate `window_sec` at gate construction (like category
+  specs): a degenerate window raises there instead of from inside
+  `try_acquire` mid-flight. Non-finite (NaN/inf) windows are rejected for
+  burst and sustained windows alike — a NaN window silently disabled the
+  limiter.
+- `flood_wait_remaining_seconds` boundary note: a fractional remainder just
+  above the transient threshold (the 60–61s band) classifies as blocking,
+  consistent with the ≤60s policy (truncation used to call it transient).
+- `FloodCircuitBreaker`: one cooldown per trip — `record_flood` no longer
+  extends a running cooldown (late reports from calls already in flight keep
+  the original trial time; a flood after the deadline expired starts a fresh
+  cooldown), and `record_success` lifts a running suspension unconditionally:
+  a stale mid-trial report can re-trip the breaker, and the trial's success
+  must still close the pair.
 - `ResolveRateLimiter.try_acquire_many` raises the same `ValueError` as the
   burst check when `slots` exceeds `sustained_max_calls` (it used to raise
   `IndexError` from an empty sustained window).
@@ -21,9 +34,9 @@ Review-driven correctness fixes; no API changes.
 - `flood_wait_remaining_seconds` ceils fractional remaining time: a flood
   expiring in 0.6s now classifies as transient (remaining=1) instead of
   collapsing to 0 — neither transient nor blocking.
-- `run_with_flood_wait_retry` counts the per-iteration sleep buffer in the
-  transient budget, so n retries can no longer overshoot
-  `transient_wait_budget_sec` by up to n seconds.
+- `run_with_flood_wait_retry` accumulates the per-retry cost (wait + buffer)
+  against the transient budget, so total actual sleep can no longer exceed
+  `transient_wait_budget_sec`.
 - `handle_flood_wait` supports synchronous `report_flood` hooks (the result
   is awaited only when awaitable) — a sync hook used to crash flood handling
   with `TypeError`.

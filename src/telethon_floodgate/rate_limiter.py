@@ -18,7 +18,7 @@ import random
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
-from math import ceil
+from math import ceil, isfinite
 
 # Telegram does not publish the ``auth.resolveUsername`` limit. Production
 # evidence points at roughly 30 calls / account / minute before escalation can
@@ -86,10 +86,11 @@ class ResolveRateLimiter:
     ) -> None:
         self._max_calls = max(1, int(max_calls))
         self._window_sec = float(window_sec)
-        if self._window_sec <= 0:
+        if not (isfinite(self._window_sec) and self._window_sec > 0):
             raise ValueError(
-                "window_sec must be > 0: a non-positive window prunes every "
-                "entry immediately and silently disables the limiter"
+                "window_sec must be finite and > 0: a non-positive window "
+                "prunes every entry instantly, a NaN one never defers — "
+                "either way the limiter silently disables"
             )
         self._jitter_sec = max(0.0, float(jitter_sec))
         self._time = time_func
@@ -108,6 +109,8 @@ class ResolveRateLimiter:
         self._sustained_calls: dict[str, deque[float]] | None = None
         if sustained_max_calls is not None:
             sustained_window_sec_f = float(sustained_window_sec)  # type: ignore[arg-type]
+            if not isfinite(sustained_window_sec_f):
+                raise ValueError("sustained_window_sec must be finite")
             if sustained_window_sec_f < self._window_sec:
                 raise ValueError(
                     "sustained_window_sec must be >= window_sec: the sustained "

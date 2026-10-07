@@ -267,4 +267,6 @@ async def run_with_flood_wait_retry(
             ):
                 raise
             await sleep_for_handled_flood_wait(exc.info, logger_=logger_)
-            waited_seconds += wait_seconds
+            # Accumulate what the retry actually cost (wait + buffer) —
+            # accounting bare waits still let n retries overshoot by n-1.
+            waited_seconds += wait_seconds + FLOOD_WAIT_RETRY_BUFFER_SEC

@@ -144,6 +144,19 @@ class FloodCircuitBreaker:
             self._breakers[key] = breaker
         return breaker
 
+    def _cooldown_remaining(
+        self, key: tuple[str, str], now: float
+    ) -> float | None:
+        """Seconds left on a running suspension, else None.
+
+        The single definition of "cooldown running": check() grants a trial
+        exactly when this is None, record_flood re-arms exactly then too.
+        """
+        open_until = self._open_until.get(key)
+        if open_until is None or now >= open_until:
+            return None
+        return open_until - now
+
     def check(self, operation: str, phone: str | None) -> None:
         """Raise if this operation is suspended for this account.
 
@@ -167,10 +180,10 @@ class FloodCircuitBreaker:
                     operation, phone, self._cooldown_seconds
                 )
             return
-        open_until = self._open_until.get(key)
         now = self._time()
-        if open_until is not None and now < open_until:
-            raise TelegramOperationSuspendedError(operation, phone, open_until - now)
+        remaining = self._cooldown_remaining(key, now)
+        if remaining is not None:
+            raise TelegramOperationSuspendedError(operation, phone, remaining)
         # Cooldown elapsed: flip to half-open directly rather than through the
         # open state's before_call, which would spend the trial slot on a no-op
         # probe. The upcoming real call becomes the genuine trial -- claimed
@@ -192,13 +205,14 @@ class FloodCircuitBreaker:
             # FloodWaitError it is handling stays the exception that propagates.
             pass
         now = self._time()
-        current = self._open_until.get(key)
         # One cooldown per trip: reports from calls already in flight when the
         # breaker opened (duplicate report paths included) land while the
         # deadline still runs and must not extend it; a flood arriving after
-        # the deadline expired starts a fresh cooldown.
+        # the deadline expired starts a fresh cooldown. The predicate is the
+        # negation of check()'s grant boundary on purpose — one definition in
+        # _cooldown_remaining keeps them from drifting.
         if breaker.current_state == pybreaker.STATE_OPEN and (
-            current is None or now >= current
+            self._cooldown_remaining(key, now) is None
         ):
             self._open_until[key] = now + self._cooldown_seconds
 
@@ -213,17 +227,24 @@ class FloodCircuitBreaker:
         # absence). Kept so the set means what its name says.
         self._probe_in_flight.discard(key)
         breaker = self._breakers.get(key)
-        if breaker is None or breaker.fail_counter == 0:
+        if breaker is None:
+            return
+        # A successful trial is the freshest evidence that the operation
+        # works, so it lifts a running suspension unconditionally: a stale
+        # report from a pre-open call can re-trip the breaker mid-trial (and
+        # reset the fail counter), and without this the success would leave
+        # the pair suspended for a full extra cooldown despite real success.
+        self._open_until.pop(key, None)
+        if breaker.fail_counter == 0:
             # Nothing to reset. Skipping the no-op keeps the hot path free of
             # pybreaker bookkeeping on the overwhelmingly common success case.
             return
         try:
             breaker.call(lambda: None)
         except pybreaker.CircuitBreakerError:
-            # Open with cooldown unexpired: check() would have raised, so this
-            # is defence in depth only.
+            # The deadline was lifted above; pybreaker's own cooldown may
+            # still run, the next check() re-probes directly.
             return
-        self._open_until.pop(key, None)
 
     def reset(self, operation: str | None = None, phone: str | None = None) -> None:
         """Drop breaker state (all, or one operation/phone slice)."""

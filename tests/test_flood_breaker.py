@@ -237,3 +237,23 @@ def test_flood_after_an_expired_deadline_starts_a_fresh_cooldown():
     assert exc.value.retry_after_sec == pytest.approx(300.0)
 
 
+def test_stale_report_during_a_trial_cannot_overrule_its_success():
+    """A stale report from a call already in flight before the breaker opened
+    may re-trip the breaker mid-trial; the trial's success must still lift the
+    suspension — success is the fresher evidence, and without this the pair
+    would sit out a full extra cooldown despite a real success."""
+    clock = _Clock()
+    breaker = _breaker(clock, threshold=1)
+    breaker.record_flood(OP, PHONE)  # opens at t=1000, until t=1300
+    clock.advance(301.0)
+    breaker.check(OP, PHONE)  # trial granted
+
+    clock.advance(1.0)  # t=1302: stale pre-open report lands mid-trial
+    breaker.record_flood(OP, PHONE)  # re-trips and re-arms until t=1602
+
+    clock.advance(3.0)  # t=1305: the real trial succeeds
+    breaker.record_success(OP, PHONE)
+
+    breaker.check(OP, PHONE)  # must not raise for another 300s
+
+
