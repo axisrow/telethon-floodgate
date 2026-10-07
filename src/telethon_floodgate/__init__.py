@@ -26,6 +26,7 @@ from telethon_floodgate.flood_wait import (
     FLOOD_WAIT_RETRY_BUFFER_SEC,
     TRANSIENT_FLOOD_WAIT_MAX_SEC,
     TRANSIENT_FLOOD_WAIT_RETRY_BUDGET_SEC,
+    FloodReportingGate,
     FloodWaitInfo,
     HandledFloodWaitError,
     coerce_flood_wait_seconds,
@@ -60,13 +61,14 @@ from telethon_floodgate.rate_limiter import (
 )
 from telethon_floodgate.token_bucket import TokenBucket
 
-__version__ = "0.2.0"
+__version__ = "0.1.3"
 
 __all__ = [
     "DEFAULT_COOLDOWN_SECONDS",
     "DEFAULT_FLOOD_THRESHOLD",
     "FLOOD_WAIT_RETRY_BUFFER_SEC",
     "FloodCircuitBreaker",
+    "FloodReportingGate",
     "FloodWaitInfo",
     "GLOBAL_RESOLVE_BACKOFF_THRESHOLD_SEC",
     "HandledFloodWaitError",

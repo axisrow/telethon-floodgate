@@ -13,7 +13,7 @@ import logging
 import time
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from telethon.requestiter import RequestIter
@@ -54,7 +54,15 @@ DIALOG_PAGE_MAX_CALLS = 1000
 class RateLimitSpec:
     max_calls: int
     window_sec: float
-    jitter_sec: float = 0.0
+    # Defer jitter in seconds. None (default) derives window_sec * 0.05 — the
+    # anti-lockstep default spreads retries so accounts unblocking at the
+    # same instant do not re-burst in lockstep. 0.0 disables explicitly.
+    jitter_sec: float | None = None
+
+
+def _effective_jitter(spec: RateLimitSpec) -> float:
+    """Resolved defer jitter: the explicit value, or 5% of the window."""
+    return spec.window_sec * 0.05 if spec.jitter_sec is None else spec.jitter_sec
 
 
 class TelegramRateLimitedError(RuntimeError):
@@ -141,6 +149,10 @@ class TelegramRateLimitGate:
     # the sleeper until the whole defer elapses.
     ACQUIRE_SLEEP_CAP_SEC = 30.0
 
+    # Defer jitter: specs leave jitter_sec unset, deriving 5% of the window
+    # (anti-lockstep — uniform(0, jitter) added to every defer by the single
+    # limiter mechanism). Starting ratio — recalibrate against production
+    # samples; per-category override stays jitter_sec on the spec, 0.0 = off.
     DEFAULT_SPEC = RateLimitSpec(max_calls=1000, window_sec=60.0)
     # #1330 showed repeated getDialogs floods even with multi-minute pauses.
     # Keep this deliberately low until production logs calibrate the value.
@@ -169,10 +181,9 @@ class TelegramRateLimitGate:
     # account bursting into many different peers is still bounded by the
     # category, while an account hammering one peer is stopped long before it.
     # A small margin absorbs clock/network variation around the one-second
-    # observation; the live test proved this pacing on a real user peer. A
-    # 0.15s defer jitter keeps retried sends from firing metronome-precisely
-    # on the window boundary (same lockstep rationale as ResolveRateLimiter's
-    # own jitter).
+    # observation; the live test proved this pacing on a real user peer. The
+    # explicit 0.15s jitter (~13% of this tight window, above the derived 5%)
+    # keeps retried sends from firing metronome-precisely on the boundary.
     SEND_PEER_USER_SPEC = RateLimitSpec(max_calls=1, window_sec=1.1, jitter_sec=0.15)
     SEND_PEER_CHANNEL_SPEC = RateLimitSpec(max_calls=16, window_sec=60.0)
     SEND_PEER_CHAT_SPEC = RateLimitSpec(max_calls=16, window_sec=60.0)
@@ -207,6 +218,12 @@ class TelegramRateLimitGate:
             "default": self.DEFAULT_SPEC,
         }
         specs.update(category_limits or {})
+        # Resolve None-jitter to the window-derived default once, so limiter
+        # construction and snapshot read the same effective values.
+        specs = {
+            category: replace(spec, jitter_sec=_effective_jitter(spec))
+            for category, spec in specs.items()
+        }
         # One clock for the gate and every limiter: mixing an injected gate
         # clock with limiter-side monotonic compares timestamps from two
         # timelines and miscomputes defers — exactly under injected clocks.
@@ -218,7 +235,7 @@ class TelegramRateLimitGate:
             category: ResolveRateLimiter(
                 max_calls=spec.max_calls,
                 window_sec=spec.window_sec,
-                jitter_sec=spec.jitter_sec,
+                jitter_sec=_effective_jitter(spec),
                 time_func=self._time_func,
                 **({"jitter_func": jitter_func} if jitter_func is not None else {}),
             )
@@ -244,6 +261,10 @@ class TelegramRateLimitGate:
             "send:chat": self.SEND_PEER_CHAT_SPEC,
         }
         self._peer_specs.update(peer_limits or {})
+        self._peer_specs = {
+            key: replace(spec, jitter_sec=_effective_jitter(spec))
+            for key, spec in self._peer_specs.items()
+        }
         self._peer_max_buckets = max(1, int(peer_max_buckets))
         self._peer_buckets: OrderedDict[tuple[str, str, str], ResolveRateLimiter] = OrderedDict()
 
@@ -255,12 +276,12 @@ class TelegramRateLimitGate:
     def note_flood(self, phone: str, seconds: float | None = None) -> float:
         """Record a server-side FLOOD_WAIT; returns the current defer multiplier.
 
-        The consumer wires this from its flood reporting (e.g. a
-        ``pool.report_flood`` hook) — the gate never sees Telegram errors
-        itself. Only waits above TRANSIENT_FLOOD_WAIT_MAX_SEC escalate: routine
-        ≤60s pacing floods are Telegram's sweep protocol working as designed
-        (see DIALOG_SWEEP_SPEC), while a blocking wait is proof the static
-        calibration is stale for this phone. ``seconds=None`` (severity
+        Usually fed automatically via ``handle_flood_wait(..., gate=...)`` —
+        do NOT also call it from a pool-report hook then, or events
+        double-count. Only waits above TRANSIENT_FLOOD_WAIT_MAX_SEC escalate:
+        routine ≤60s pacing floods are Telegram's sweep protocol working as
+        designed (see DIALOG_SWEEP_SPEC), while a blocking wait is proof the
+        static calibration is stale for this phone. ``seconds=None`` (severity
         unknown) counts conservatively.
         """
         if not self._flood_backoff:
@@ -436,7 +457,7 @@ class TelegramRateLimitGate:
             limiter = ResolveRateLimiter(
                 max_calls=spec.max_calls,
                 window_sec=spec.window_sec,
-                jitter_sec=spec.jitter_sec,
+                jitter_sec=_effective_jitter(spec),
                 time_func=self._time_func,
                 **(
                     {"jitter_func": self._jitter_func}

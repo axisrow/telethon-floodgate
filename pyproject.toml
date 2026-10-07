@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "telethon-floodgate"
-version = "0.2.0"
+version = "0.1.3"
 description = "Flood-wait handling, proactive rate-limit gate and circuit breaker for Telethon user accounts"
 readme = "README.md"
 license = {text = "MIT"}

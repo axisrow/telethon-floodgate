@@ -173,6 +173,12 @@ await run_with_flood_wait_retry(factory, operation="fetch", phone=phone, pool=po
 flooded account — persist that to your own storage; the library is
 storage-agnostic.
 
+Pass `gate=` (any object with `note_flood(phone, seconds)`, e.g. the
+`TelegramRateLimitGate` you already hold) to the same helpers and every
+handled FLOOD_WAIT also feeds the gate's optional adaptive backoff — no
+manual wiring needed. Don't ALSO call `note_flood` from a `report_flood`
+hook when passing `gate=`: that double-counts.
+
 ## Design notes
 
 - Everything runs on one event loop with in-memory state and no DB. The gate

@@ -16,6 +16,17 @@ from telethon_floodgate.flood_wait import (
 )
 
 
+class _FakeGate:
+    """Duck-typed TelegramRateLimitGate stand-in recording note_flood calls."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, float | None]] = []
+
+    def note_flood(self, phone: str, seconds: float | None = None) -> float:
+        self.calls.append((phone, seconds))
+        return 2.0
+
+
 async def test_run_with_flood_wait_returns_success_value():
     result = await run_with_flood_wait(
         AsyncMock(return_value="ok")(),
@@ -42,6 +53,27 @@ async def test_handle_flood_wait_reports_pool_and_builds_info():
     assert info.wait_seconds == 33
     assert "Flood wait 33s" in info.detail
     pool.report_flood.assert_awaited_once_with("+7000", 33)
+
+
+async def test_handle_flood_wait_feeds_the_gate():
+    """The wiring that closes the adaptive-backoff loop."""
+    err = FloodWaitError(request=None, capture=0)
+    err.seconds = 90
+    gate = _FakeGate()
+
+    await handle_flood_wait(err, operation="op", phone="+7000", gate=gate)
+
+    assert gate.calls == [("+7000", 90)]
+
+
+async def test_handle_flood_wait_gate_needs_a_phone():
+    err = FloodWaitError(request=None, capture=0)
+    err.seconds = 90
+    gate = _FakeGate()
+
+    await handle_flood_wait(err, operation="op", phone=None, gate=gate)
+
+    assert gate.calls == []
 
 
 async def test_run_with_flood_wait_raises_handled_error_with_info():
@@ -206,6 +238,7 @@ async def test_run_with_flood_wait_retry_waits_for_transient_flood(monkeypatch):
     calls = {"count": 0}
     sleeps = []
     pool = AsyncMock()
+    gate = _FakeGate()
 
     async def fake_sleep(seconds):
         sleeps.append(seconds)
@@ -223,9 +256,12 @@ async def test_run_with_flood_wait_retry_waits_for_transient_flood(monkeypatch):
         operation="retry_op",
         phone="+7000",
         pool=pool,
+        gate=gate,
     )
 
     assert result == "ok"
     assert calls["count"] == 2
     assert sleeps == [4.0]
     pool.report_flood.assert_awaited_once_with("+7000", 3)
+    # The flooded round was reported to the gate; the clean retry was not.
+    assert gate.calls == [("+7000", 3)]
