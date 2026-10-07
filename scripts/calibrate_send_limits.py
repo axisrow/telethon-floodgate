@@ -35,7 +35,7 @@ from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 
-from telethon_floodgate import RateLimitSpec, TelegramRateLimitGate
+from telethon_floodgate import TelegramRateLimitGate
 
 GATE_ENV = "RUN_FLOODGATE_LIVE_TG"
 REQUIRED_ENV = ("REAL_TG_API_ID", "REAL_TG_API_HASH", "REAL_TG_PHONE", "REAL_TG_SESSION")
@@ -74,24 +74,28 @@ class CalibrationReport:
 
 def build_recommendation(safe_interval: float | None) -> str:
     """Verdict comparing the measured boundary to the packaged default."""
-    default_window = TelegramRateLimitGate.SEND_PEER_USER_SPEC.window_sec
+    spec = TelegramRateLimitGate.SEND_PEER_USER_SPEC
+    default = f"1 message / {spec.window_sec:.1f}s + {spec.jitter_sec}s defer jitter"
+    suggested = (
+        f"RateLimitSpec(max_calls=1, window_sec="
+        f"{round((safe_interval or 0) * 1.25, 2)}, jitter_sec={spec.jitter_sec})"
+        if safe_interval is not None
+        else ""
+    )
     if safe_interval is None:
         return (
             "no clean point measured — no interval held without a flood; "
-            "do not lower the default (1 message / "
-            f"{default_window:.0f}s per user peer) based on this run"
+            f"do not lower the default ({default} per user peer) based on this run"
         )
-    suggested = RateLimitSpec(max_calls=1, window_sec=round(safe_interval * 1.25, 2))
     if safe_interval >= 1.0:
         return (
             f"flood-free only down to {safe_interval:.2f}s between sends — the packaged "
-            f"default (1 message / {default_window:.0f}s per user peer) is TOO PERMISSIVE; "
-            f"suggest RateLimitSpec(max_calls=1, window_sec={suggested.window_sec})"
+            f"default ({default} per user peer) is TOO PERMISSIVE; suggest {suggested}"
         )
     return (
         f"flood-free down to {safe_interval:.2f}s between sends — the packaged default "
-        f"(1 message / {default_window:.0f}s per user peer) is conservative and safe; "
-        f"a tighter option would be RateLimitSpec(max_calls=1, window_sec={suggested.window_sec})"
+        f"({default} per user peer) is conservative and safe; a tighter option would "
+        f"be {suggested}"
     )
 
 

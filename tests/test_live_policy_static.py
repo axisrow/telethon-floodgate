@@ -170,7 +170,17 @@ async def test_live_send_pacing_and_flood_stop_offline(monkeypatch, flood_at):
     monkeypatch.setattr(harness, "TelegramClient", constructor)
     monkeypatch.setattr(send_test, "time", SimpleNamespace(monotonic=lambda: clock.now))
     monkeypatch.setattr(send_test, "asyncio", SimpleNamespace(sleep=sleep))
-    monkeypatch.setattr(send_test, "TelegramRateLimitGate", lambda: TelegramRateLimitGate(time_func=lambda: clock.now))
+    # Packaged send:user spec with a pinned zero jitter: the exact 1.1s
+    # pacing math is asserted deterministically against the real default
+    # (the 0.15s defer jitter ships in SEND_PEER_USER_SPEC).
+    monkeypatch.setattr(
+        send_test,
+        "TelegramRateLimitGate",
+        lambda: TelegramRateLimitGate(
+            time_func=lambda: clock.now,
+            jitter_func=lambda *args: 0.0,
+        ),
+    )
 
     async with aclosing(harness.live_telegram.__wrapped__()) as fixture:
         sandbox = await anext(fixture)
