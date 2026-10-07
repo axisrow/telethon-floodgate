@@ -49,7 +49,11 @@ async def test_every_message_page_is_gated_without_mutating_shared_client(mode):
     if mode == "search":
         kwargs["search"] = "test"
     iterator = raw.iter_messages(7, **kwargs)
-    gate = TelegramRateLimitGate(category_limits={"history": RateLimitSpec(1, 10)}, time_func=lambda: now)
+    gate = TelegramRateLimitGate(
+        category_limits={"history": RateLimitSpec(1, 10)},
+        time_func=lambda: now,
+        jitter_func=lambda low, high: 0,  # exact defer math asserted below
+    )
     assert gate.wrap_messages_iterator(iterator, "+1", sleep=sleep) is iterator
     result = [message async for message in iterator]
 

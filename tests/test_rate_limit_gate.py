@@ -9,6 +9,7 @@ from telethon_floodgate.rate_limit_gate import (
     TelegramPeerRateLimitedError,
     TelegramRateLimitedError,
     TelegramRateLimitGate,
+    _effective_jitter,
 )
 
 
@@ -506,21 +507,16 @@ def test_peer_user_spec_jitters_by_default() -> None:
 
 
 def test_every_category_ships_default_jitter() -> None:
-    """The lockstep re-burst fix must cover all categories, not just peers."""
-    for spec in (
-        TelegramRateLimitGate.DEFAULT_SPEC,
-        TelegramRateLimitGate.DIALOGS_SPEC,
-        TelegramRateLimitGate.DIALOG_SWEEP_SPEC,
-        TelegramRateLimitGate.DIALOG_PAGE_SPEC,
-        TelegramRateLimitGate.HISTORY_SPEC,
-        TelegramRateLimitGate.ADMIN_ACTION_SPEC,
-        TelegramRateLimitGate.SEND_SPEC,
-        TelegramRateLimitGate.CHANNEL_LIFECYCLE_SPEC,
-        TelegramRateLimitGate.SEND_PEER_USER_SPEC,
-        TelegramRateLimitGate.SEND_PEER_CHANNEL_SPEC,
-        TelegramRateLimitGate.SEND_PEER_CHAT_SPEC,
-    ):
-        assert spec.jitter_sec > 0.0, spec
+    """The lockstep re-burst fix must cover all categories, not just peers.
+
+    Iterates the authoritative registry (not a hand list), so a newly added
+    category without jitter fails here.
+    """
+    gate = TelegramRateLimitGate()
+    specs = list(gate._category_specs.values()) + list(gate._peer_specs.values())
+    assert len(specs) >= 11
+    for spec in specs:
+        assert _effective_jitter(spec) > 0.0, spec
 
 
 def test_category_jitter_applies_through_the_single_mechanism() -> None:
@@ -529,8 +525,10 @@ def test_category_jitter_applies_through_the_single_mechanism() -> None:
         time_func=clock, jitter_func=lambda low, high: high  # jitter = full value
     )
     gate.try_acquire("+1", "dialogs")
-    # 60s window defer + the packaged 3s default jitter, via the limiter path.
-    assert gate.try_acquire("+1", "dialogs") == 63.0
+    # Window defer + the packaged derived default, via the limiter path; the
+    # expectation tracks the spec so recalibrating the ratio stays green.
+    spec = TelegramRateLimitGate.DIALOGS_SPEC
+    assert gate.try_acquire("+1", "dialogs") == spec.window_sec + _effective_jitter(spec)
 
 
 def test_category_jitter_is_per_category_configurable() -> None:

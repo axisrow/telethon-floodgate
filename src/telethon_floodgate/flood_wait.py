@@ -127,18 +127,14 @@ async def handle_flood_wait(
         if callable(reporter):
             await reporter(phone, wait_seconds)
 
-    # Close the adaptive-backoff loop: the gate never sees Telegram errors,
-    # so the flood reporting is what tells it the static calibration drifted.
-    # Passing gate= here REPLACES any manual pool-hook → note_flood wiring —
-    # keeping both double-counts events and inflates the multiplier. The
-    # gate applies its own 60s transient threshold (regardless of this
-    # helper's transient_wait_max_sec) and is a no-op until the consumer
-    # constructs it with flood_backoff=True.
     active_logger = logger_ or logger
 
+    # Feed the gate's adaptive backoff — the contract (delivery replaces any
+    # manual hook, the 60s filter is the gate's own, no-op without
+    # flood_backoff=True) lives on FloodReportingGate.note_flood.
     if gate is not None and phone:
         multiplier = gate.note_flood(phone, wait_seconds)
-        if multiplier is not None:
+        if multiplier and multiplier > 1.0:
             active_logger.debug(
                 "%s: gate backoff multiplier now %.1fx for %s",
                 operation,
