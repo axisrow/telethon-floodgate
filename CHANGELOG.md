@@ -5,17 +5,19 @@
 Adaptive flood backoff wired end-to-end, gate observability, jitter everywhere.
 
 - `handle_flood_wait`, `run_with_flood_wait` and `run_with_flood_wait_retry`
-  accept `gate=` (structural `FloodReportingGate` protocol): every handled
-  FLOOD_WAIT is reported to the gate via `note_flood(phone, seconds)`,
+  accept `gate=` (structural `FloodReportingGate` protocol, exported): every
+  handled FLOOD_WAIT is reported to the gate via `note_flood(phone, seconds)`,
   closing the adaptive-backoff loop — the gate only needs to be passed once
-  at the call site. `pool.report_flood` semantics unchanged.
-- All category and peer specs ship non-zero default defer jitter (~5% of the
-  window through the single limiter mechanism): 3s on 60s windows
-  (default/dialogs/dialog_sweep/dialogs_page/admin/send, channel+chat
+  at the call site. `pool.report_flood` semantics unchanged; if you wired a
+  manual `pool.report_flood` hook to call `note_flood`, REMOVE that hook when
+  passing `gate=` — keeping both double-counts events. The gate reports are
+  a no-op unless the gate was constructed with `flood_backoff=True`.
+- All category and peer specs ship non-zero default defer jitter (sized
+  relative to the window, through the single limiter mechanism): 3s on 60s
+  windows (default/dialogs/dialog_sweep/dialogs_page/admin/send, channel+chat
   peers), 1.5s on history's 30s, 15s on channel_lifecycle's 300s, 0.15s on
-  the 1.1s user peer. Starting values — recalibrate against production
+  the tight 1.1s user peer. Starting values — recalibrate against production
   samples; per-category override stays `jitter_sec` on the spec.
-- `TelegramRateLimitGate.note_flood(phone, seconds)` — opt-in per-gate
 
 - `TelegramRateLimitGate.note_flood(phone, seconds)` — opt-in per-gate
   adaptive backoff (`flood_backoff=True`): every reported FLOOD_WAIT **above

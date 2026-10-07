@@ -13,9 +13,15 @@ from telethon_floodgate._datetime import try_parse_utc_datetime
 
 
 class FloodReportingGate(Protocol):
-    """Structural slice of TelegramRateLimitGate the flood helpers need."""
+    """Structural slice of TelegramRateLimitGate the flood helpers need.
 
-    def note_flood(self, phone: str, seconds: float | None = None) -> float: ...
+    The helpers deliver EVERY wait — including routine ≤60s pacing floods;
+    filtering those is the implementation's contract (the concrete gate
+    ignores them). The return is ``float | None`` so lenient reporting hooks
+    may return nothing; the concrete gate returns the new multiplier.
+    """
+
+    def note_flood(self, phone: str, seconds: float | None = None) -> float | None: ...
 
 
 logger = logging.getLogger(__name__)
@@ -123,14 +129,23 @@ async def handle_flood_wait(
 
     # Close the adaptive-backoff loop: the gate never sees Telegram errors,
     # so the flood reporting is what tells it the static calibration drifted.
-    # note_flood itself ignores routine ≤60s pacing floods.
+    # Passing gate= here REPLACES any manual pool-hook → note_flood wiring —
+    # keeping both double-counts events and inflates the multiplier. The
+    # gate applies its own 60s transient threshold (regardless of this
+    # helper's transient_wait_max_sec) and is a no-op until the consumer
+    # constructs it with flood_backoff=True.
+    active_logger = logger_ or logger
+
     if gate is not None and phone:
         multiplier = gate.note_flood(phone, wait_seconds)
-        logger.debug(
-            "%s: gate backoff multiplier now %.1fx for %s", operation, multiplier, phone
-        )
+        if multiplier is not None:
+            active_logger.debug(
+                "%s: gate backoff multiplier now %.1fx for %s",
+                operation,
+                multiplier,
+                phone,
+            )
 
-    active_logger = logger_ or logger
     if is_transient_flood_wait_seconds(wait_seconds):
         active_logger.info("%s: transient %s", operation, detail)
     else:

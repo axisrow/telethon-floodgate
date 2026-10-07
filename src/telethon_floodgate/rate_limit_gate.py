@@ -141,15 +141,20 @@ class TelegramRateLimitGate:
     # the sleeper until the whole defer elapses.
     ACQUIRE_SLEEP_CAP_SEC = 30.0
 
-    # Defer jitter defaults: ~5% of the window, spread through the single
-    # limiter mechanism (uniform(0, jitter_sec) added to every defer) so a
-    # batch of accounts unblocked at the same instant does not re-burst in
-    # lockstep. Starting values — recalibrate against production samples;
-    # per-category override stays jitter_sec on the spec.
-    DEFAULT_SPEC = RateLimitSpec(max_calls=1000, window_sec=60.0, jitter_sec=3.0)
+    # Defer jitter defaults: sized relative to the window, spread through
+    # the single limiter mechanism (uniform(0, jitter_sec) added to every
+    # defer) so a batch of accounts unblocked at the same instant does not
+    # re-burst in lockstep. Starting values — recalibrate against production
+    # samples; per-category override stays jitter_sec on the spec.
+    _JITTER_SEC_60S_WINDOW = 3.0
+    DEFAULT_SPEC = RateLimitSpec(
+        max_calls=1000, window_sec=60.0, jitter_sec=_JITTER_SEC_60S_WINDOW
+    )
     # #1330 showed repeated getDialogs floods even with multi-minute pauses.
     # Keep this deliberately low until production logs calibrate the value.
-    DIALOGS_SPEC = RateLimitSpec(max_calls=1, window_sec=60.0, jitter_sec=3.0)
+    DIALOGS_SPEC = RateLimitSpec(
+        max_calls=1, window_sec=60.0, jitter_sec=_JITTER_SEC_60S_WINDOW
+    )
     # A dialog sweep is one operation continued across passes, not repeated
     # calls: each pass resumes from the cursor with DIFFERENT offsets, which is
     # not the "same method, same parameters" shape error 420 is defined
@@ -159,17 +164,21 @@ class TelegramRateLimitGate:
     # stopped by the flood breaker (#1372) and the loop's own no-progress
     # check, not by starving it here.
     DIALOG_SWEEP_SPEC = RateLimitSpec(
-        max_calls=DIALOG_SWEEP_MAX_CALLS, window_sec=60.0, jitter_sec=3.0
+        max_calls=DIALOG_SWEEP_MAX_CALLS, window_sec=60.0, jitter_sec=_JITTER_SEC_60S_WINDOW
     )
     DIALOG_PAGE_SPEC = RateLimitSpec(
-        max_calls=DIALOG_PAGE_MAX_CALLS, window_sec=60.0, jitter_sec=3.0
+        max_calls=DIALOG_PAGE_MAX_CALLS, window_sec=60.0, jitter_sec=_JITTER_SEC_60S_WINDOW
     )
     # messages.getHistory empirical boundary: 30 requests in roughly 30s on
     # the calibrated account/channel (31st request returned FLOOD_WAIT_3).
     # Keep a 20% margin; Telegram does not publish this quota.
     HISTORY_SPEC = RateLimitSpec(max_calls=24, window_sec=30.0, jitter_sec=1.5)
-    ADMIN_ACTION_SPEC = RateLimitSpec(max_calls=10, window_sec=60.0, jitter_sec=3.0)
-    SEND_SPEC = RateLimitSpec(max_calls=30, window_sec=60.0, jitter_sec=3.0)
+    ADMIN_ACTION_SPEC = RateLimitSpec(
+        max_calls=10, window_sec=60.0, jitter_sec=_JITTER_SEC_60S_WINDOW
+    )
+    SEND_SPEC = RateLimitSpec(
+        max_calls=30, window_sec=60.0, jitter_sec=_JITTER_SEC_60S_WINDOW
+    )
     CHANNEL_LIFECYCLE_SPEC = RateLimitSpec(max_calls=3, window_sec=300.0, jitter_sec=15.0)
     # Per-peer send limits (community-observed, not published by Telegram):
     # roughly one message per second to the same private chat and about
@@ -183,8 +192,12 @@ class TelegramRateLimitGate:
     # on the window boundary (same lockstep rationale as ResolveRateLimiter's
     # own jitter).
     SEND_PEER_USER_SPEC = RateLimitSpec(max_calls=1, window_sec=1.1, jitter_sec=0.15)
-    SEND_PEER_CHANNEL_SPEC = RateLimitSpec(max_calls=16, window_sec=60.0, jitter_sec=3.0)
-    SEND_PEER_CHAT_SPEC = RateLimitSpec(max_calls=16, window_sec=60.0, jitter_sec=3.0)
+    SEND_PEER_CHANNEL_SPEC = RateLimitSpec(
+        max_calls=16, window_sec=60.0, jitter_sec=_JITTER_SEC_60S_WINDOW
+    )
+    SEND_PEER_CHAT_SPEC = RateLimitSpec(
+        max_calls=16, window_sec=60.0, jitter_sec=_JITTER_SEC_60S_WINDOW
+    )
 
     def __init__(
         self,
