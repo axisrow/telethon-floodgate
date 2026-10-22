@@ -16,18 +16,22 @@ INFO, so nothing stood out.
 The key is (operation, phone), not the account alone: a broken warm-up on one
 account must not stop message collection everywhere else.
 
-pybreaker drives the state machine, following the notifier's proven usage
-(``src/telegram/notifier.py``): it is a *synchronous* library, so the async call
-runs outside ``CircuitBreaker.call`` and the breaker is advanced afterwards with
-a trivial sync callable. See :meth:`record_flood` / :meth:`record_success`.
+The state machine is explicit (closed/open/half_open: one deque-free counter,
+one deadline dict) rather than pybreaker-driven (#15). pybreaker is
+synchronous, so the old integration advanced it after the fact via a
+``breaker.call(self._raise_probe)`` failure-counting trick, mirrored the real
+deadline in a parallel ``_open_until`` dict, and had its half-open path driven
+directly from ``check()`` -- the library was only partially in charge anyway.
+The FSM keeps the exact public API (``check`` / ``record_flood`` /
+``record_success`` / ``reset``) and thresholds; the semantics were proven in
+the telegram-mcp port (axisrow/telegram-mcp#28), where the same test spec runs
+against this implementation unchanged.
 """
 
 from __future__ import annotations
 
 import logging
 import time
-
-import pybreaker
 
 from telethon_floodgate.rate_limit_gate import TelegramRateLimitedError
 
@@ -52,6 +56,10 @@ HALF_OPEN_RETRY_HINT_SECONDS = 2.0
 # the same way in axisrow/telegram-mcp#28).
 PROBE_RECLAIM_AFTER_COOLDOWNS = 1.0
 
+_CLOSED = "closed"
+_OPEN = "open"
+_HALF_OPEN = "half_open"
+
 
 class TelegramOperationSuspendedError(TelegramRateLimitedError):
     """Raised instead of calling Telegram while the breaker is open.
@@ -68,48 +76,6 @@ class TelegramOperationSuspendedError(TelegramRateLimitedError):
         # stay meaningful ("Proactive %s rate limit ...").
         super().__init__(phone, operation, retry_after_sec)
         self.operation = operation
-
-
-class _FloodProbeError(RuntimeError):
-    """Marker fed to pybreaker to count a failure; never escapes this module."""
-
-
-class _BreakerListener(pybreaker.CircuitBreakerListener):
-    """Log state transitions -- the signal that was missing for four months."""
-
-    def __init__(self, key: tuple[str, str], cooldown_seconds: float) -> None:
-        self._operation, self._phone = key
-        self._cooldown_seconds = cooldown_seconds
-
-    def state_change(
-        self,
-        cb: pybreaker.CircuitBreaker,
-        old_state: pybreaker.CircuitBreakerState | None,
-        new_state: pybreaker.CircuitBreakerState,
-    ) -> None:
-        old_name = old_state.name if old_state is not None else None
-        if new_state.name == pybreaker.STATE_OPEN:
-            reason = (
-                "half-open probe flooded again"
-                if old_name == pybreaker.STATE_HALF_OPEN
-                else f"{cb.fail_counter} flood waits"
-            )
-            logger.warning(
-                "Telegram breaker OPEN: %s on %s (%s); suspending this operation for %.0fs",
-                self._operation,
-                self._phone,
-                reason,
-                self._cooldown_seconds,
-            )
-        elif new_state.name == pybreaker.STATE_CLOSED and old_name in (
-            pybreaker.STATE_OPEN,
-            pybreaker.STATE_HALF_OPEN,
-        ):
-            logger.info(
-                "Telegram breaker closed: %s on %s resumed",
-                self._operation,
-                self._phone,
-            )
 
 
 class FloodCircuitBreaker:
@@ -132,7 +98,8 @@ class FloodCircuitBreaker:
         self._threshold = max(1, int(threshold))
         self._cooldown_seconds = max(0.1, float(cooldown_seconds))
         self._time = time_func or time.monotonic
-        self._breakers: dict[tuple[str, str], pybreaker.CircuitBreaker] = {}
+        self._states: dict[tuple[str, str], str] = {}
+        self._fails: dict[tuple[str, str], int] = {}
         self._open_until: dict[tuple[str, str], float] = {}
         # Keys whose half-open trial call has been granted but not yet
         # resolved, mapped to the grant time on the time_func clock.
@@ -152,23 +119,7 @@ class FloodCircuitBreaker:
         # (#955).
         self._probe_in_flight: dict[tuple[str, str], float] = {}
 
-    def _breaker_for(self, key: tuple[str, str]) -> pybreaker.CircuitBreaker:
-        breaker = self._breakers.get(key)
-        if breaker is None:
-            breaker = pybreaker.CircuitBreaker(
-                fail_max=self._threshold,
-                reset_timeout=self._cooldown_seconds,
-                success_threshold=1,
-                name=f"{key[0]}@{key[1]}",
-                throw_new_error_on_trip=False,
-                listeners=[_BreakerListener(key, self._cooldown_seconds)],
-            )
-            self._breakers[key] = breaker
-        return breaker
-
-    def _cooldown_remaining(
-        self, key: tuple[str, str], now: float
-    ) -> float | None:
+    def _cooldown_remaining(self, key: tuple[str, str], now: float) -> float | None:
         """Seconds left on a running suspension, else None.
 
         The single definition of "cooldown running": check() grants a trial
@@ -188,77 +139,97 @@ class FloodCircuitBreaker:
         if not phone:
             return
         key = (operation, phone)
-        breaker = self._breakers.get(key)
-        if breaker is None:
+        state = self._states.get(key)
+        if state is None or state == _CLOSED:
             return
-        state = breaker.current_state
         now = self._time()
-        if state != pybreaker.STATE_OPEN:
-            # A trial granted to someone else is still awaiting its Telegram
-            # call. Until it reports back, this operation is still suspended:
-            # letting everyone through on HALF_OPEN would send the whole backlog
-            # at an account Telegram is actively throttling.
-            granted_at = self._probe_in_flight.get(key)
-            if state == pybreaker.STATE_HALF_OPEN and granted_at is not None:
-                if now - granted_at < self._cooldown_seconds * PROBE_RECLAIM_AFTER_COOLDOWNS:
-                    # Honest hint, not the flat cooldown (#13) -- see the constant.
-                    raise TelegramOperationSuspendedError(
-                        operation,
-                        phone,
-                        min(self._cooldown_seconds, HALF_OPEN_RETRY_HINT_SECONDS),
-                    )
-                # Self-heal (#14): a claim this old has no live caller behind
-                # it -- a probe cannot legitimately outlive the suspension
-                # window that granted it. Hand the trial to this caller and
-                # refresh the stamp instead of refusing forever. Loud here on
-                # purpose: nothing else observes a reclaim (pybreaker
-                # listeners cannot see it, and the new trial usually settles
-                # as a plain success), so this is the only trace a call site
-                # violating the settle contract leaves.
-                logger.warning(
-                    "Telegram breaker: %s on %s half-open probe never settled, %.0fs past the %.0fs"
-                    " reclaim window; handing the trial to this caller",
+        if state == _OPEN:
+            remaining = self._cooldown_remaining(key, now)
+            if remaining is not None:
+                raise TelegramOperationSuspendedError(operation, phone, remaining)
+            # Cooldown elapsed: the upcoming real call becomes the genuine
+            # trial -- claimed here, released by record_flood/record_success
+            # (or re-claimed after a full cooldown of silence, per the
+            # backstop below).
+            self._states[key] = _HALF_OPEN
+            self._probe_in_flight[key] = now
+            return
+        # HALF_OPEN: a trial granted to someone else is still awaiting its
+        # Telegram call. Until it reports back, this operation is still
+        # suspended: letting everyone through would send the whole backlog at
+        # an account Telegram is actively throttling.
+        granted_at = self._probe_in_flight.get(key)
+        if granted_at is not None:
+            if now - granted_at < self._cooldown_seconds * PROBE_RECLAIM_AFTER_COOLDOWNS:
+                # Honest hint, not the flat cooldown (#13) -- see the constant.
+                raise TelegramOperationSuspendedError(
                     operation,
                     phone,
-                    now - granted_at - self._cooldown_seconds * PROBE_RECLAIM_AFTER_COOLDOWNS,
-                    self._cooldown_seconds * PROBE_RECLAIM_AFTER_COOLDOWNS,
+                    min(self._cooldown_seconds, HALF_OPEN_RETRY_HINT_SECONDS),
                 )
-                self._probe_in_flight[key] = now
-            return
-        remaining = self._cooldown_remaining(key, now)
-        if remaining is not None:
-            raise TelegramOperationSuspendedError(operation, phone, remaining)
-        # Cooldown elapsed: flip to half-open directly rather than through the
-        # open state's before_call, which would spend the trial slot on a no-op
-        # probe. The upcoming real call becomes the genuine trial -- claimed
-        # here, released by record_flood/record_success (or re-claimed after a
-        # full cooldown of silence, per the backstop above).
-        breaker.half_open()
-        self._probe_in_flight[key] = now
+            # Self-heal (#14): a claim this old has no live caller behind it --
+            # a probe cannot legitimately outlive the suspension window that
+            # granted it. Hand the trial to this caller and refresh the stamp
+            # instead of refusing forever. Loud here on purpose: nothing else
+            # observes a reclaim, and the new trial usually settles as a plain
+            # success, so this is the only trace a call site violating the
+            # settle contract leaves.
+            logger.warning(
+                "Telegram breaker: %s on %s half-open probe never settled, %.0fs past the %.0fs"
+                " reclaim window; handing the trial to this caller",
+                operation,
+                phone,
+                now - granted_at - self._cooldown_seconds * PROBE_RECLAIM_AFTER_COOLDOWNS,
+                self._cooldown_seconds * PROBE_RECLAIM_AFTER_COOLDOWNS,
+            )
+            self._probe_in_flight[key] = now
 
     def record_flood(self, operation: str, phone: str | None) -> None:
         """Count a flood wait against this (operation, phone)."""
         if not phone:
             return
         key = (operation, phone)
-        breaker = self._breaker_for(key)
-        try:
-            breaker.call(self._raise_probe)
-        except (_FloodProbeError, pybreaker.CircuitBreakerError):
-            # Expected: the marker counts the failure, the trip error is the
-            # breaker opening. Neither must reach the caller -- the real
-            # FloodWaitError it is handling stays the exception that propagates.
-            pass
+        state = self._states.get(key, _CLOSED)
         now = self._time()
+        if state == _HALF_OPEN:
+            # The trial flooded: the breaker reopens with a fresh cooldown, so
+            # the next deadline grants a fresh trial and the pair cannot wedge
+            # (#14 -- a flooded trial must never consume all future trials).
+            self._states[key] = _OPEN
+            self._open_until[key] = now + self._cooldown_seconds
+            logger.warning(
+                "Telegram breaker OPEN: %s on %s (half-open probe flooded again); "
+                "suspending this operation for %.0fs",
+                operation,
+                phone,
+                self._cooldown_seconds,
+            )
+            return
+        fails = self._fails.get(key, 0) + 1
+        self._fails[key] = fails
+        # Materialize the key's state even below the threshold: record_success
+        # must find it to clear the counter (the pybreaker version created the
+        # breaker object here for the same reason).
+        self._states[key] = state
+        if fails < self._threshold:
+            return
+        if state != _OPEN:
+            logger.warning(
+                "Telegram breaker OPEN: %s on %s (%d flood waits); "
+                "suspending this operation for %.0fs",
+                operation,
+                phone,
+                fails,
+                self._cooldown_seconds,
+            )
+        self._states[key] = _OPEN
         # One cooldown per trip: reports from calls already in flight when the
         # breaker opened (duplicate report paths included) land while the
         # deadline still runs and must not extend it; a flood arriving after
         # the deadline expired starts a fresh cooldown. The predicate is the
         # negation of check()'s grant boundary on purpose — one definition in
         # _cooldown_remaining keeps them from drifting.
-        if breaker.current_state == pybreaker.STATE_OPEN and (
-            self._cooldown_remaining(key, now) is None
-        ):
+        if self._cooldown_remaining(key, now) is None:
             self._open_until[key] = now + self._cooldown_seconds
 
     def record_success(self, operation: str, phone: str | None) -> None:
@@ -272,8 +243,8 @@ class FloodCircuitBreaker:
         # never consulted for a key that is not HALF_OPEN (no test can fail
         # on its absence). Kept so the dict means what its name says.
         self._probe_in_flight.pop(key, None)
-        breaker = self._breakers.get(key)
-        if breaker is None:
+        state = self._states.get(key)
+        if state is None:
             return
         # A successful trial is the freshest evidence that the operation
         # works, so it lifts a running suspension unconditionally: a stale
@@ -281,32 +252,28 @@ class FloodCircuitBreaker:
         # reset the fail counter), and without this the success would leave
         # the pair suspended for a full extra cooldown despite real success.
         self._open_until.pop(key, None)
-        if breaker.fail_counter == 0:
-            # Nothing to reset. Skipping the no-op keeps the hot path free of
-            # pybreaker bookkeeping on the overwhelmingly common success case.
-            return
-        try:
-            breaker.call(lambda: None)
-        except pybreaker.CircuitBreakerError:
-            # The deadline was lifted above; pybreaker's own cooldown may
-            # still run, the next check() re-probes directly.
-            return
+        self._fails.pop(key, None)
+        self._states[key] = _CLOSED
+        if state in (_OPEN, _HALF_OPEN):
+            logger.info(
+                "Telegram breaker closed: %s on %s resumed",
+                operation,
+                phone,
+            )
 
     def reset(self, operation: str | None = None, phone: str | None = None) -> None:
         """Drop breaker state (all, or one operation/phone slice)."""
         if operation is None and phone is None:
-            self._breakers.clear()
+            self._states.clear()
+            self._fails.clear()
             self._open_until.clear()
             self._probe_in_flight.clear()
             return
-        for key in [k for k in self._breakers if _matches(k, operation, phone)]:
-            self._breakers.pop(key, None)
+        for key in [k for k in self._states if _matches(k, operation, phone)]:
+            self._states.pop(key, None)
+            self._fails.pop(key, None)
             self._open_until.pop(key, None)
             self._probe_in_flight.pop(key, None)
-
-    @staticmethod
-    def _raise_probe() -> None:
-        raise _FloodProbeError
 
 
 def _matches(key: tuple[str, str], operation: str | None, phone: str | None) -> bool:

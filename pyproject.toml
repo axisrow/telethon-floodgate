@@ -26,7 +26,6 @@ classifiers = [
 dependencies = [
     "telethon>=1.36,<2",
     "pydantic>=2.0,<3",
-    "pybreaker>=1.4.0",
 ]
 
 [project.urls]
