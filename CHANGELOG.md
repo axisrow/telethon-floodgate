@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- `FloodCircuitBreaker.check()`: a HALF_OPEN-busy refusal (another coroutine's
+  trial call still in flight) now reports an honest short retry hint
+  (`min(cooldown_seconds, 2.0)`) instead of the flat full cooldown — the
+  in-flight trial typically resolves within seconds, and callers honoring
+  `retry_after` used to idle out a suspension that was already lifting (#13).
+
 ## 0.1.4 (2026-10-07)
 
 Review-driven correctness fixes; no API changes.

@@ -176,8 +176,13 @@ class FloodCircuitBreaker:
             # letting everyone through on HALF_OPEN would send the whole backlog
             # at an account Telegram is actively throttling.
             if state == pybreaker.STATE_HALF_OPEN and key in self._probe_in_flight:
+                # Honest hint, not the flat cooldown (#13): the in-flight trial
+                # typically resolves within seconds, and a caller honoring
+                # retry_after would otherwise idle out a suspension that is
+                # already lifting. min() only guards a cooldown configured
+                # below the hint itself.
                 raise TelegramOperationSuspendedError(
-                    operation, phone, self._cooldown_seconds
+                    operation, phone, min(self._cooldown_seconds, 2.0)
                 )
             return
         now = self._time()
