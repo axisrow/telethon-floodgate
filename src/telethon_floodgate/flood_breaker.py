@@ -225,7 +225,6 @@ class FloodCircuitBreaker:
                 )
                 self._probe_in_flight[key] = now
             return
-            return
         remaining = self._cooldown_remaining(key, now)
         if remaining is not None:
             raise TelegramOperationSuspendedError(operation, phone, remaining)
