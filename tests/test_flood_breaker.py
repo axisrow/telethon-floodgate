@@ -262,3 +262,46 @@ def test_stale_report_during_a_trial_cannot_overrule_its_success():
     breaker.check(OP, PHONE)  # must not raise for another 300s
 
 
+def test_ghost_probe_self_heals_instead_of_wedging_the_pair():
+    """#14: a granted call that reports neither flood nor success used to
+    wedge the pair forever -- the claim lived in _probe_in_flight with nobody
+    left to release it, and every later check() refused with a flat cooldown.
+    A probe cannot legitimately outlive the suspension window that granted it,
+    so after one full cooldown of silence check() hands the trial to the next
+    caller instead."""
+    clock = _Clock()
+    breaker = _breaker(clock)
+    for _ in range(3):
+        breaker.record_flood(OP, PHONE)
+
+    clock.advance(301.0)
+    breaker.check(OP, PHONE)  # trial granted; its caller vanishes without reporting
+
+    clock.advance(301.0)  # a full cooldown of silence -- the claim is a ghost
+    breaker.check(OP, PHONE)  # self-heals: this caller becomes the trial
+    breaker.record_success(OP, PHONE)
+    breaker.check(OP, PHONE)  # recovered: normal flow again
+
+
+def test_probe_reclaim_keeps_the_single_trial_exclusive():
+    """The backstop must not weaken the one-trial guarantee: a live claim
+    still blocks everyone until a full cooldown passes, and a re-claimed
+    trial is exclusive again for the new caller."""
+    clock = _Clock()
+    breaker = _breaker(clock)
+    for _ in range(3):
+        breaker.record_flood(OP, PHONE)
+
+    clock.advance(301.0)  # trial granted at t=1301
+    breaker.check(OP, PHONE)
+
+    clock.advance(299.0)  # t=1600: 1s short of the reclaim window
+    with pytest.raises(TelegramOperationSuspendedError):
+        breaker.check(OP, PHONE)
+
+    clock.advance(1.0)  # t=1601: a full cooldown in flight -> re-claim
+    breaker.check(OP, PHONE)
+    with pytest.raises(TelegramOperationSuspendedError):
+        breaker.check(OP, PHONE)  # the refreshed claim blocks the next caller
+
+

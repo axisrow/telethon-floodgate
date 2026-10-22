@@ -8,6 +8,16 @@
   instead of the flat full cooldown — the in-flight trial typically resolves
   within seconds, and callers honoring `retry_after` used to idle out a
   suspension that was already lifting (#13).
+- `FloodCircuitBreaker.check()` self-heals a wedged half-open probe (#14): a
+  granted call that reports neither `record_flood()` nor `record_success()`
+  (unexpected exception, cancellation, a wrapper bug) used to hold the
+  (operation, phone) pair in HALF_OPEN forever — every later `check()` refused
+  with a flat cooldown, and only `reset()` or a restart recovered it. A probe
+  cannot legitimately outlive the suspension window that granted it, so
+  `check()` now re-claims a trial still in flight longer than one cooldown.
+  The exactly-once reporting contract (settle each granted trial with exactly
+  one `record_flood`/`record_success`, ideally from a `finally` around the
+  Telegram call) is documented on `_probe_in_flight`.
 
 ## 0.1.4 (2026-10-07)
 
