@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from telethon_floodgate.flood_breaker import (
+    HALF_OPEN_RETRY_HINT_SECONDS,
     FloodCircuitBreaker,
     TelegramOperationSuspendedError,
 )
@@ -107,7 +108,7 @@ def test_trial_call_in_flight_blocks_everyone_else():
     # suspension that is already lifting.
     with pytest.raises(TelegramOperationSuspendedError) as exc:
         breaker.check(OP, PHONE)
-    assert exc.value.retry_after_sec == pytest.approx(2.0)
+    assert exc.value.retry_after_sec == pytest.approx(HALF_OPEN_RETRY_HINT_SECONDS)
 
     # The trial reports back: the slot is released and the breaker decides.
     breaker.record_success(OP, PHONE)

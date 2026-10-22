@@ -40,6 +40,11 @@ DEFAULT_FLOOD_THRESHOLD = 3
 # How long the operation stays blocked for that account before a single trial
 # call is allowed through.
 DEFAULT_COOLDOWN_SECONDS = 300.0
+# Honest retry hint for a HALF_OPEN-busy refusal (#13): the in-flight trial
+# typically resolves within seconds, so callers honoring retry_after get this
+# instead of the flat cooldown -- which would idle them out of a suspension
+# that is already lifting. Capped by the configured cooldown at the raise site.
+HALF_OPEN_RETRY_HINT_SECONDS = 2.0
 
 
 class TelegramOperationSuspendedError(TelegramRateLimitedError):
@@ -176,13 +181,9 @@ class FloodCircuitBreaker:
             # letting everyone through on HALF_OPEN would send the whole backlog
             # at an account Telegram is actively throttling.
             if state == pybreaker.STATE_HALF_OPEN and key in self._probe_in_flight:
-                # Honest hint, not the flat cooldown (#13): the in-flight trial
-                # typically resolves within seconds, and a caller honoring
-                # retry_after would otherwise idle out a suspension that is
-                # already lifting. min() only guards a cooldown configured
-                # below the hint itself.
+                # Honest hint, not the flat cooldown (#13) -- see the constant.
                 raise TelegramOperationSuspendedError(
-                    operation, phone, min(self._cooldown_seconds, 2.0)
+                    operation, phone, min(self._cooldown_seconds, HALF_OPEN_RETRY_HINT_SECONDS)
                 )
             return
         now = self._time()
