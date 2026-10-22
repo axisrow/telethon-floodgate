@@ -210,7 +210,19 @@ class FloodCircuitBreaker:
                 # Self-heal (#14): a claim this old has no live caller behind
                 # it -- a probe cannot legitimately outlive the suspension
                 # window that granted it. Hand the trial to this caller and
-                # refresh the stamp instead of refusing forever.
+                # refresh the stamp instead of refusing forever. Loud here on
+                # purpose: nothing else observes a reclaim (pybreaker
+                # listeners cannot see it, and the new trial usually settles
+                # as a plain success), so this is the only trace a call site
+                # violating the settle contract leaves.
+                logger.warning(
+                    "Telegram breaker: %s on %s half-open probe never settled, %.0fs past the %.0fs"
+                    " reclaim window; handing the trial to this caller",
+                    operation,
+                    phone,
+                    now - granted_at - self._cooldown_seconds * PROBE_RECLAIM_AFTER_COOLDOWNS,
+                    self._cooldown_seconds * PROBE_RECLAIM_AFTER_COOLDOWNS,
+                )
                 self._probe_in_flight[key] = now
             return
             return
