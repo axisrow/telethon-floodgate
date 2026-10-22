@@ -18,6 +18,16 @@
   The exactly-once reporting contract (settle each granted trial with exactly
   one `record_flood`/`record_success`, ideally from a `finally` around the
   Telegram call) is documented on `_probe_in_flight`.
+- `FloodCircuitBreaker` no longer depends on pybreaker (#15): the three-state
+  machine (closed/open/half_open) is explicit — a fail counter and a deadline
+  dict per (operation, phone) — with the same public API (`check` /
+  `record_flood` / `record_success` / `reset`), thresholds and cooldown. This
+  removes the pybreaker-shaped integration (the failure-counting probe trick,
+  the listener bridge, the parallel `_open_until` bookkeeping) that was the
+  hardest-to-follow part of the codebase; semantics proven in the telegram-mcp
+  port (axisrow/telegram-mcp#28), including the #13 retry hint and the #14
+  self-heal above. `pybreaker` is dropped from the dependencies — the package
+  needs only telethon and pydantic.
 
 ## 0.1.4 (2026-10-07)
 

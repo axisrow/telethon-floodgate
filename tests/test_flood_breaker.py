@@ -305,3 +305,18 @@ def test_probe_reclaim_keeps_the_single_trial_exclusive():
         breaker.check(OP, PHONE)  # the refreshed claim blocks the next caller
 
 
+def test_half_open_busy_refusal_reports_a_short_hint():
+    """A caller refused mid-probe gets seconds, not the flat cooldown: the
+    probe usually resolves within moments, and an agent honoring the
+    fabricated 300s idles out a suspension that is already lifting."""
+    clock = _Clock()
+    breaker = _breaker(clock)
+    for _ in range(3):
+        breaker.record_flood(OP, PHONE)
+    clock.advance(301.0)
+    breaker.check(OP, PHONE)  # grants the single trial
+    with pytest.raises(TelegramOperationSuspendedError) as exc:
+        breaker.check(OP, PHONE)  # a second caller while the probe is in flight
+    assert exc.value.retry_after_sec == pytest.approx(HALF_OPEN_RETRY_HINT_SECONDS)
+
+

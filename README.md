@@ -17,8 +17,8 @@ bucket is configurable.
 pip install telethon-floodgate
 ```
 
-Requires Python 3.11+, [Telethon](https://github.com/LonamiWebs/Telethon) 1.x,
-pydantic 2.x and pybreaker.
+Requires Python 3.11+, [Telethon](https://github.com/LonamiWebs/Telethon) 1.x
+and pydantic 2.x.
 
 ## The three layers
 
