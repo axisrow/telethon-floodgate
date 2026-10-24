@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.5 (2026-10-24)
 
 - `FloodCircuitBreaker.check()`: a HALF_OPEN-busy refusal (another coroutine's
   trial call still in flight) now reports an honest short retry hint
