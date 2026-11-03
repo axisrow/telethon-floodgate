@@ -197,6 +197,10 @@ class FloodCircuitBreaker:
             # (#14 -- a flooded trial must never consume all future trials).
             self._states[key] = _OPEN
             self._open_until[key] = now + self._cooldown_seconds
+            # The trial settled as a flood, so release its claim here too, not
+            # just in record_success (#6): a settled stamp must not sit in
+            # _probe_in_flight until the next grant happens to overwrite it.
+            self._probe_in_flight.pop(key, None)
             logger.warning(
                 "Telegram breaker OPEN: %s on %s (half-open probe flooded again); "
                 "suspending this operation for %.0fs",

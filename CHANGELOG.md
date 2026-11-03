@@ -39,6 +39,14 @@
   through the permissive 1000/min default bucket with no signal at all; now
   the first call names the tag in the logs. The fallback itself is unchanged
   (still returns `default`), so behavior stays backward-compatible.
+- `FloodCircuitBreaker.record_flood()` releases the half-open probe's claim
+  when the trial settles as a flood (`record_success` already did, #6): the
+  settled stamp no longer lingers in `_probe_in_flight` until the next grant
+  happens to overwrite it. Closes the last path that leaves a claim behind
+  after its trial has resolved. New regression tests pin the issue's
+  cancellation trigger (a trial cancelled mid-await recovering through the
+  one-cooldown self-heal from 0.1.5, #14) and the claim release; a trial
+  dying on a non-flood error stays covered by the existing ghost-probe test.
 
 ## 0.1.5 (2026-10-24)
 

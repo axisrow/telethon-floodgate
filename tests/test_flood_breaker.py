@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from telethon_floodgate.flood_breaker import (
@@ -318,5 +320,48 @@ def test_half_open_busy_refusal_reports_a_short_hint():
     with pytest.raises(TelegramOperationSuspendedError) as exc:
         breaker.check(OP, PHONE)  # a second caller while the probe is in flight
     assert exc.value.retry_after_sec == pytest.approx(HALF_OPEN_RETRY_HINT_SECONDS)
+
+
+async def test_cancelled_trial_frees_the_pair_after_the_reclaim_window():
+    """#6: a trial cancelled mid-await (a supervisor timeout, a shutdown) dies
+    before its caller can report, leaking the claim. The pair must not stay
+    suspended forever: within the reclaim window the one-trial exclusivity
+    still holds, after one cooldown of silence check() hands the trial to the
+    next caller, and a success closes the breaker again."""
+    clock = _Clock()
+    breaker = _breaker(clock, threshold=1)
+    breaker.record_flood(OP, PHONE)  # opens at t=1000, until t=1300
+
+    clock.advance(301.0)  # t=1301: trial granted to a caller...
+    breaker.check(OP, PHONE)
+    task = asyncio.create_task(asyncio.sleep(3600))  # ...whose Telegram call...
+    await asyncio.sleep(0)  # let the call start awaiting
+    task.cancel()  # ...is cancelled: no record_* ever runs
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    with pytest.raises(TelegramOperationSuspendedError):
+        breaker.check(OP, PHONE)  # exclusivity holds inside the reclaim window
+
+    clock.advance(301.0)  # t=1602: a full cooldown of silence -- ghost claim
+    breaker.check(OP, PHONE)  # self-heals: this caller becomes the trial
+    breaker.record_success(OP, PHONE)
+    breaker.check(OP, PHONE)  # recovered
+
+
+def test_flooded_trial_releases_the_probe_claim():
+    """#6: a settled trial must leave no claim behind. record_flood on the
+    half-open trial used to leave the settled stamp in _probe_in_flight until
+    the next grant overwrote it -- harmless to check(), but exactly the
+    leftover the issue is about, and a lie about what the dict means."""
+    clock = _Clock()
+    breaker = _breaker(clock, threshold=1)
+    breaker.record_flood(OP, PHONE)
+    clock.advance(301.0)
+    breaker.check(OP, PHONE)
+    assert breaker._probe_in_flight  # the trial is claimed while in flight
+
+    breaker.record_flood(OP, PHONE)  # the trial settles as a flood
+    assert not breaker._probe_in_flight  # nothing left behind
 
 
