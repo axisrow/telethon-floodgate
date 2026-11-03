@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- `scripts/calibrate_send_limits.py`: a point cut short by the
+  `--max-messages`/`--max-seconds` budget no longer counts as a flood-free
+  interval (#9) — with the old clean-filter (only `flooded`/`sent > 0`
+  checked) the truncated last point could become `safe_interval` and the
+  report would recommend `window_sec = interval × 1.25` for an interval
+  validated by a single send. Points now carry a `truncated` flag in the
+  report, budget-cut points stay out of the flood-free verdict, and when no
+  interval held its full send count the recommendation names the budget (not
+  floods) as the reason and advises against lowering the default. Note: with
+  default budgets (50 messages vs 7×8 points) the final point is always
+  budget-truncated — pass `--max-messages 56` if you want the full ladder
+  measured.
+
 ## 0.1.5 (2026-10-24)
 
 - `FloodCircuitBreaker.check()`: a HALF_OPEN-busy refusal (another coroutine's
