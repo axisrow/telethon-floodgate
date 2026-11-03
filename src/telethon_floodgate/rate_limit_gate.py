@@ -123,6 +123,13 @@ _OPERATION_CATEGORIES = {
 }
 
 
+# Warn-once dedup for the default fallback below (#10): a hot path must not
+# spam one line per call, but total silence is how a registration gap hides
+# behind the permissive 1000/min default bucket. Tags are static call-site
+# constants, so the set stays at a handful of entries for the process life.
+_WARNED_UNKNOWN_OPERATIONS: set[str] = set()
+
+
 def _category_for_operation(operation: str) -> str:
     """Return a category for both canonical and decorated operation tags.
 
@@ -130,6 +137,10 @@ def _category_for_operation(operation: str) -> str:
     ``resolve_channel_warm_dialog_cache``) so that flood diagnostics retain
     their useful context.  Matching the stable suffix prevents those paths
     from silently falling back to the broad default bucket.
+
+    A truly unknown tag keeps the backward-compatible ``default`` fallback,
+    but logs a warning the first time so a missed registration (or a typo)
+    surfaces in logs instead of running unlimited-in-practice (#10).
     """
     exact = _OPERATION_CATEGORIES.get(operation)
     if exact is not None:
@@ -138,6 +149,14 @@ def _category_for_operation(operation: str) -> str:
         return "dialog_sweep"
     if operation.endswith("_warm_dialog_cache"):
         return "dialogs"
+    if operation not in _WARNED_UNKNOWN_OPERATIONS:
+        _WARNED_UNKNOWN_OPERATIONS.add(operation)
+        logger.warning(
+            "operation %r is not registered in _OPERATION_CATEGORIES; using the "
+            "permissive 'default' category — register the tag or fix the typo "
+            "to restore real limiting",
+            operation,
+        )
     return "default"
 
 

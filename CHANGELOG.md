@@ -14,6 +14,12 @@
   default budgets (50 messages vs 7×8 points) the final point is always
   budget-truncated — pass `--max-messages 56` if you want the full ladder
   measured.
+- Unknown operation tags falling back to the `default` category now log one
+  `logger.warning` per tag — on the first fallback only (#10). A new consumer
+  tag (`telegram_send_poll`) or a typo (`telegram_send_mesage`) used to run
+  through the permissive 1000/min default bucket with no signal at all; now
+  the first call names the tag in the logs. The fallback itself is unchanged
+  (still returns `default`), so behavior stays backward-compatible.
 
 ## 0.1.5 (2026-10-24)
 
