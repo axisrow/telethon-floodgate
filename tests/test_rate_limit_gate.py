@@ -161,6 +161,77 @@ def test_peer_refusal_does_not_burn_the_category_slot() -> None:
     assert gate.try_acquire("+1", "send", peer="user:43") > 0.0
 
 
+def test_category_refusal_leaves_no_phantom_peer_slot() -> None:
+    """Issue #8: "deferral reserves nothing" holds for the peer+category pair.
+
+    The peer slot used to be recorded BEFORE the category check, so every
+    category-refused retry burned a peer slot for a send that never happened;
+    under adaptive backoff each phantom shifted the real send by another peer
+    window.
+    """
+    clock = _Clock()
+    gate = TelegramRateLimitGate(
+        category_limits={"send": RateLimitSpec(max_calls=1, window_sec=60)},
+        peer_limits={"send:user": RateLimitSpec(max_calls=5, window_sec=300)},
+        time_func=clock,
+        jitter_func=_no_jitter,
+    )
+
+    assert gate.try_acquire("+1", "send", peer="user:42") == 0.0
+    # The category is full while the peer bucket has room: the deferral must
+    # not record a peer slot for the send that did not happen.
+    assert gate.try_acquire("+1", "send", peer="user:42") == 60.0
+    assert gate.snapshot("+1")["peer_buckets"]["send:user:42"]["used"] == 1
+    # Retries while the category stays full burn nothing anywhere — under the
+    # pre-fix ordering each of these left a phantom peer entry behind.
+    for _ in range(5):
+        assert gate.try_acquire("+1", "send", peer="user:42") == 60.0
+    assert gate.snapshot("+1")["peer_buckets"]["send:user:42"]["used"] == 1
+    # Once the category unblocks, the retry goes through at once and the peer
+    # bucket holds only the two real sends.
+    clock.now += 60.0
+    assert gate.try_acquire("+1", "send", peer="user:42") == 0.0
+    assert gate.snapshot("+1")["peer_buckets"]["send:user:42"]["used"] == 2
+
+
+def test_both_windows_full_defers_on_the_peer_bucket() -> None:
+    """When both windows refuse, the caller still sees the peer defer — the
+    tighter budget — exactly as before the two-phase composition."""
+    clock = _Clock()
+    gate = TelegramRateLimitGate(
+        category_limits={"send": RateLimitSpec(max_calls=1, window_sec=60)},
+        peer_limits={"send:user": RateLimitSpec(max_calls=1, window_sec=300)},
+        time_func=clock,
+        jitter_func=_no_jitter,
+    )
+
+    assert gate.try_acquire("+1", "send", peer="user:42") == 0.0
+    assert gate.try_acquire("+1", "send", peer="user:42") == 300.0
+    assert gate.snapshot("+1")["categories"]["send"]["used"] == 1
+    assert gate.snapshot("+1")["peer_buckets"]["send:user:42"]["used"] == 1
+
+
+def test_compound_slots_reserve_both_buckets_atomically() -> None:
+    """``slots=n`` spans category AND peer as one all-or-nothing reservation."""
+    clock = _Clock()
+    gate = TelegramRateLimitGate(
+        category_limits={"send": RateLimitSpec(max_calls=3, window_sec=60)},
+        peer_limits={"send:user": RateLimitSpec(max_calls=3, window_sec=60)},
+        time_func=clock,
+        jitter_func=_no_jitter,
+    )
+
+    assert gate.try_acquire("+1", "send", slots=2, peer="user:42") == 0.0
+    # Exactly one slot free in each window: a 2-slot ask defers as a whole
+    # and records nothing in either bucket.
+    assert gate.try_acquire("+1", "send", slots=2, peer="user:42") == 60.0
+    snap = gate.snapshot("+1")
+    assert snap["categories"]["send"]["used"] == 2
+    assert snap["peer_buckets"]["send:user:42"]["used"] == 2
+    assert gate.try_acquire("+1", "send", peer="user:42") == 0.0  # the last slot
+    assert gate.try_acquire("+1", "send", peer="user:42") == 60.0  # both full
+
+
 def test_peer_channel_bucket_allows_sixteen_per_minute() -> None:
     clock = _Clock()
     gate = TelegramRateLimitGate(time_func=clock, jitter_func=_no_jitter)

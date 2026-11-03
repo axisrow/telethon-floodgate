@@ -231,3 +231,49 @@ def test_non_positive_window_is_rejected():
     """A non-positive window prunes every entry instantly: a silent no-op."""
     with pytest.raises(ValueError, match="window_sec"):
         ResolveRateLimiter(max_calls=1, window_sec=0)
+
+
+def test_peek_many_defers_without_recording():
+    """peek_many is read-only: the same defer try_acquire_many would return."""
+    clock = _FakeClock()
+    limiter = _limiter(clock, max_calls=1, window=60.0)
+
+    assert limiter.try_acquire("+1") == 0.0
+    assert limiter.peek_many("+1", 1) == 60.0
+    assert limiter.used("+1") == 1  # unchanged
+    clock.advance(60)
+    assert limiter.peek_many("+1", 1) == 0.0  # would admit...
+    assert limiter.used("+1") == 0  # ...but still recorded nothing
+
+
+def test_peek_then_record_equals_try_acquire():
+    """The gate's two-phase pair composes to the same state as one acquire."""
+    clock = _FakeClock()
+    two_phase = _limiter(clock, max_calls=2, window=60.0)
+    single_phase = _limiter(clock, max_calls=2, window=60.0)
+
+    assert two_phase.peek_many("+1", 1) == 0.0
+    two_phase.record_many("+1", 1)
+    assert single_phase.try_acquire("+1") == 0.0
+
+    clock.advance(30)
+    assert two_phase.try_acquire("+1") == 0.0
+    assert single_phase.peek_many("+1", 1) == 0.0
+    single_phase.record_many("+1", 1)
+
+    # Identical history: both full, identical honest defer.
+    assert two_phase.used("+1") == single_phase.used("+1") == 2
+    assert two_phase.peek_many("+1", 1) == single_phase.peek_many("+1", 1) == 30.0
+
+
+def test_record_many_fills_both_windows_like_acquire():
+    clock = _TieredFakeClock()
+    limiter = _tiered(clock, sustained_calls=2)
+
+    limiter.record_many("+1", 2)
+    # Both windows are now full: the next call defers on the sustained tier.
+    assert limiter.try_acquire("+1") > 0.0
+    clock.now += 60  # burst freed, sustained entries still hold the window
+    assert limiter.peek_many("+1", 1) > 0.0
+    clock.now += 3540  # t=3600: the sustained window drained too
+    assert limiter.try_acquire("+1") == 0.0
