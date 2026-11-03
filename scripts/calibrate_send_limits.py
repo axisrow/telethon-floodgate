@@ -11,7 +11,8 @@ a JSON report with a verdict against the packaged ``SEND_PEER_USER_SPEC``.
 Safety contract:
 - sends ONLY to Saved Messages (``--peer`` defaults to the account itself);
 - hard budgets: ``--max-messages`` and ``--max-seconds`` stop the run even
-  without a flood;
+  without a flood; a point cut short by the budget is marked ``truncated``
+  in the report and never counts as a flood-free interval (#9);
 - every FloodWaitError is a real strike against the account, so the defaults
   are deliberately conservative — the budget is a ceiling, not a goal.
 
@@ -56,6 +57,11 @@ class PointResult:
     sent: int
     flooded: bool = False
     flood_wait_sec: float | None = None
+    # True when the message/time budget cut this point short: it never saw
+    # its full send count, so a lack of flood here is not evidence the
+    # interval is safe — such a point must stay out of the flood-free
+    # verdict (#9).
+    truncated: bool = False
 
 
 @dataclass
@@ -72,7 +78,7 @@ class CalibrationReport:
         return json.dumps(asdict(self), indent=2, ensure_ascii=False)
 
 
-def build_recommendation(safe_interval: float | None) -> str:
+def build_recommendation(safe_interval: float | None, *, budget_stopped: bool = False) -> str:
     """Verdict comparing the measured boundary to the packaged default."""
     spec = TelegramRateLimitGate.SEND_PEER_USER_SPEC
     default = f"1 message / {spec.window_sec:.1f}s + {spec.jitter_sec}s defer jitter"
@@ -83,8 +89,14 @@ def build_recommendation(safe_interval: float | None) -> str:
         else ""
     )
     if safe_interval is None:
+        cause = (
+            "the run was cut by the message/time budget before any interval "
+            "held its full send count"
+            if budget_stopped
+            else "no interval held without a flood"
+        )
         return (
-            "no clean point measured — no interval held without a flood; "
+            f"no clean point measured — {cause}; "
             f"do not lower the default ({default} per user peer) based on this run"
         )
     if safe_interval >= 1.0:
@@ -154,6 +166,7 @@ async def run_calibration(
                 # pacing sleep), so a budget stop never fires an extra message.
                 if _budget_exhausted():
                     budget_stop = True
+                    point.truncated = True
                     break
                 try:
                     message = await client.send_message(peer, _probe_text(interval, point.sent))
@@ -175,7 +188,15 @@ async def run_calibration(
             if interval != intervals[-1]:
                 await sleep(settle_seconds)
     finally:
-        clean = [p.interval for p in report.points if not p.flooded and p.sent > 0]
+        # Flood-free evidence = a point that held its FULL send count. A
+        # budget-truncated point may have validated a smaller interval with
+        # a single send; counting it here would let min(clean) recommend
+        # that unproven interval (#9).
+        clean = [
+            p.interval
+            for p in report.points
+            if not p.flooded and not p.truncated and p.sent > 0
+        ]
         report.safe_interval = min(clean) if clean else None
         if report.stopped_reason == "completed" and not clean:
             report.stopped_reason = "no sends succeeded"
@@ -196,7 +217,10 @@ async def _finish(
         # must not strike the already-flooded account. Any observed flood
         # (even one reporting seconds <= 0) earns at least a 1s pause.
         await sleep(max(flood_wait_sec, 1.0) + POST_FLOOD_BUFFER_SEC)
-    report.recommendation = build_recommendation(report.safe_interval)
+    report.recommendation = build_recommendation(
+        report.safe_interval,
+        budget_stopped=any(p.truncated for p in report.points),
+    )
     if not report.message_ids:
         report.cleaned_up = True
         return

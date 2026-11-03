@@ -183,9 +183,87 @@ async def test_max_messages_budget_stops_without_a_flood():
     assert len(client.sent) == 5
     assert report.stopped_reason.startswith("max-messages budget")
     assert report.flooded_at_interval is None
-    assert report.safe_interval == 0.5  # both points held clean sends
+    # The 0.5s point got only 2 of its 3 sends before the budget fired —
+    # truncated, so the flood-free verdict rests on the 1.0s point alone.
+    assert [(p.interval, p.sent, p.truncated) for p in report.points] == [
+        (1.0, 3, False),
+        (0.5, 2, True),
+    ]
+    assert report.safe_interval == 1.0
     assert client.deleted == [[1, 2, 3, 4, 5]]
-    assert "conservative and safe" in report.recommendation
+    assert "TOO PERMISSIVE" in report.recommendation
+
+
+async def test_budget_truncated_point_never_becomes_the_safe_interval():
+    """#9: a budget-cut point must not count as a flood-free interval.
+
+    The old clean-filter (only flooded / sent>0 checked) let the 0.2s point
+    below — validated by a SINGLE send before the budget fired — become
+    safe_interval and the report recommend window_sec=0.25 for an interval
+    that never saw its 8 messages.
+    """
+    clock = _FakeClock()
+    client = _FakeClient()
+
+    report = await calibrate.run_calibration(
+        client,
+        peer="me",
+        intervals=(1.0, 0.2),
+        messages_per_point=8,
+        settle_seconds=5.0,
+        max_messages=9,
+        sleep=clock.sleep,
+        monotonic=clock,
+    )
+
+    assert [(p.interval, p.sent, p.truncated) for p in report.points] == [
+        (1.0, 8, False),
+        (0.2, 1, True),
+    ]
+    assert report.stopped_reason.startswith("max-messages budget")
+    assert report.flooded_at_interval is None
+    assert report.safe_interval == 1.0
+    # The truncated point stays visible in the JSON report.
+    payload = json.loads(report.to_json())
+    assert payload["points"][1]["truncated"] is True
+
+
+async def test_budget_cut_before_any_full_point_recommends_no_lowering():
+    """#9: budget stopped inside the FIRST point → no evidence at all."""
+    clock = _FakeClock()
+    client = _FakeClient()
+
+    report = await calibrate.run_calibration(
+        client,
+        peer="me",
+        intervals=(1.0, 0.5),
+        messages_per_point=8,
+        max_messages=1,
+        sleep=clock.sleep,
+        monotonic=clock,
+    )
+
+    assert [(p.interval, p.sent, p.truncated) for p in report.points] == [(1.0, 1, True)]
+    assert report.safe_interval is None
+    assert report.stopped_reason.startswith("max-messages budget")
+    # The recommendation names the real cause (budget, not floods).
+    assert "budget" in report.recommendation
+    assert "do not lower the default" in report.recommendation
+
+
+def test_recommendation_without_clean_points_names_the_cause():
+    """No full point: flood stop keeps the old wording, budget stop is honest."""
+    flood_text = calibrate.build_recommendation(None)
+    assert "no interval held without a flood" in flood_text
+    assert "do not lower the default" in flood_text
+
+    budget_text = calibrate.build_recommendation(None, budget_stopped=True)
+    assert "budget" in budget_text
+    assert "held its full send count" in budget_text
+    assert "do not lower the default" in budget_text
+
+    # With a safe interval the budget flag changes nothing (flood verdicts only).
+    assert calibrate.build_recommendation(0.5, budget_stopped=True) == calibrate.build_recommendation(0.5)
 
 
 async def test_max_seconds_budget_stops_the_run():
