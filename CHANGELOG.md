@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- `try_acquire(..., slots=n)` with `n` above a bucket's `max_calls` (for
+  example a 2-message album against the 1-slot `send:user` peer bucket, or
+  `slots=2` in the 1-operation `dialogs` category) no longer raises
+  `ValueError` — the documented "never sleeps, never raises" contract holds
+  (#7). Such a request can never be admitted, so the offending bucket answers
+  with a state-independent full-window cadence defer that repeats until the
+  caller splits the request, and the refusal records nothing in any bucket
+  (the two-phase peek/commit composition is unchanged). Satisfiable `slots`
+  requests keep the atomic wait-for-the-whole-request semantics, the wider
+  sustained tier still wins the combined defer, and `record_many` keeps
+  rejecting oversized commits loudly — committing a reservation no window
+  admitted is a programming error, not a rate event.
+
 - `UsernameResolveRateLimitedError` and `UsernameResolveFloodWaitDeferredError`
   are now `TelegramRateLimitedError` subclasses instead of bare `RuntimeError`
   siblings (#11). Backwards compatible: existing `except UsernameResolve*`

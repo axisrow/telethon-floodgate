@@ -187,7 +187,11 @@ hook when passing `gate=`: that double-counts.
 - `try_acquire` never sleeps and never raises — it returns seconds to defer,
   so callers decide whether to reschedule, skip or await.
 - Atomic multi-slot reservations (`try_acquire(..., slots=n)`) are supported
-  for compound operations.
+  for compound operations. A request wider than a bucket's `max_calls` (e.g.
+  a 2-message album against the 1-slot `send:user` peer bucket) can never be
+  admitted; instead of raising, `try_acquire` defers it at that bucket's
+  window cadence, indefinitely (#7) — split such requests so each fits its
+  narrowest bucket.
 
 ## Quota evidence
 

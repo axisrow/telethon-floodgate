@@ -170,12 +170,6 @@ class ResolveRateLimiter:
         slots = int(slots)
         if slots < 1:
             raise ValueError("slots must be at least 1")
-        if slots > self._max_calls:
-            raise ValueError("slots cannot exceed max_calls")
-        if self._sustained_calls is not None and slots > self._sustained_max_calls:
-            # Same contract as the burst check: without it, slots above the
-            # sustained cap indexed an empty window and raised IndexError.
-            raise ValueError("slots cannot exceed sustained_max_calls")
         return slots
 
     def _jittered_defer(self, retry: float) -> float:
@@ -190,10 +184,20 @@ class ResolveRateLimiter:
         sustained retry (~hours) is the honest defer — returning the ~60s
         burst retry here would wake every deferred caller one extra cycle per
         window (review finding on tg_content_factory#1498).
+
+        A request wider than a tier's cap (``slots > max_calls``, #7) can
+        never be admitted — even an empty window holds at most ``max_calls``
+        entries — so the never-raises contract (README/CLAUDE.md) keeps the
+        answer a deferral: the offending tier contributes one full window of
+        cadence, state-independent because no wait makes the request
+        admissible, and it repeats until the caller splits the request. The
+        wider tier wins the ``max()`` below, matching the both-full rule.
         """
         window = self._prune(phone, now)
         retry: float | None = None
-        if len(window) + slots > self._max_calls:
+        if slots > self._max_calls:
+            retry = self._window_sec
+        elif len(window) + slots > self._max_calls:
             # Wait until enough calls have expired for the whole atomic request,
             # not merely until the oldest call leaves the window.
             calls_to_expire = len(window) + slots - self._max_calls
@@ -202,12 +206,16 @@ class ResolveRateLimiter:
             sustained_window = self._prune_window(
                 self._sustained_calls, phone, now, self._sustained_window_sec
             )
-            if len(sustained_window) + slots > self._sustained_max_calls:
+            sustained_retry: float | None = None
+            if slots > self._sustained_max_calls:
+                sustained_retry = self._sustained_window_sec
+            elif len(sustained_window) + slots > self._sustained_max_calls:
                 calls_to_expire = len(sustained_window) + slots - self._sustained_max_calls
                 sustained_retry = max(
                     (sustained_window[calls_to_expire - 1] + self._sustained_window_sec) - now,
                     0.0,
                 )
+            if sustained_retry is not None:
                 retry = sustained_retry if retry is None else max(retry, sustained_retry)
         return retry
 
@@ -231,8 +239,17 @@ class ResolveRateLimiter:
         admitted, so it cannot refuse. Gate code is synchronous with no await
         between peek and commit, so on the single event loop the pair is
         atomic by construction.
+
+        Unlike the acquire path (#7), a request wider than a tier cap still
+        raises here: committing a peek-admitted reservation no window could
+        admit is a programming error like ``slots < 1`` — recording it would
+        widen the window and corrupt every later defer.
         """
         slots = self._validate_slots(slots)
+        if slots > self._max_calls:
+            raise ValueError("slots cannot exceed max_calls")
+        if self._sustained_calls is not None and slots > self._sustained_max_calls:
+            raise ValueError("slots cannot exceed sustained_max_calls")
         now = self._time()
         self._prune(phone, now).extend([now] * slots)
         if self._sustained_calls is not None:
@@ -248,6 +265,10 @@ class ResolveRateLimiter:
         a deferred call burns no slots in any window (unlike composing two
         separate limiter instances, where a burst refusal after a sustained
         admission would burn a sustained slot).
+
+        A request wider than a tier cap (``slots > max_calls``, #7) is never
+        admitted: it returns a full-window cadence defer that repeats until
+        the caller splits the request.
         """
         slots = self._validate_slots(slots)
         retry = self._peek_retry(phone, slots, self._time())

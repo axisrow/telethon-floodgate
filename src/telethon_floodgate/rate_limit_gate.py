@@ -383,6 +383,14 @@ class TelegramRateLimitGate:
     def try_acquire(
         self, phone: str, category: str, *, slots: int = 1, peer: str | None = None
     ) -> float:
+        """Seconds to defer (``0.0`` = admitted); never sleeps, never raises.
+
+        Atomic ``slots=n`` reservation across the category and per-peer
+        buckets: a deferral records nothing in either. A request wider than a
+        bucket's cap (``slots > max_calls``, e.g. a 2-message album against
+        the 1-slot ``send:user`` peer bucket) can never be admitted and
+        defers at that bucket's window cadence indefinitely (#7) — split it.
+        """
         if category in {"resolve", "reaction"}:
             return 0.0
         # A reported flood scales every defer for this phone until the events

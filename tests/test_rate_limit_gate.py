@@ -262,6 +262,29 @@ def test_compound_slots_reserve_both_buckets_atomically() -> None:
     assert gate.try_acquire("+1", "send", peer="user:42") == 60.0  # both full
 
 
+def test_slots_above_bucket_max_defer_instead_of_raising() -> None:
+    """Issue #7: an album-sized ask against a 1-slot bucket defers, never raises.
+
+    The default ``send:user`` peer bucket caps at 1 slot, so ``slots=2`` (an
+    album to one private chat) is unfulfillable there even though the
+    account-wide ``send`` category could admit it. It used to escape as
+    ValueError from the narrow bucket, breaking the never-raises contract;
+    now the offending bucket answers with its full-window cadence and the
+    refusal records nothing anywhere."""
+    clock = _Clock()
+    gate = TelegramRateLimitGate(time_func=clock, jitter_func=_no_jitter)
+
+    assert gate.try_acquire("+1", "send", slots=2, peer="user:42") == 1.1
+    snap = gate.snapshot("+1")
+    assert snap["categories"]["send"]["used"] == 0
+    # The peer bucket is created lazily by the peek, but the refused ask
+    # recorded nothing in it.
+    assert snap["peer_buckets"]["send:user:42"]["used"] == 0
+    # Same shape for a peer-less category capped at one logical operation.
+    assert gate.try_acquire("+1", "dialogs", slots=2) == 60.0
+    assert gate.snapshot("+1")["categories"]["dialogs"]["used"] == 0
+
+
 def test_peer_channel_bucket_allows_sixteen_per_minute() -> None:
     clock = _Clock()
     gate = TelegramRateLimitGate(time_func=clock, jitter_func=_no_jitter)
