@@ -221,10 +221,48 @@ def test_reset_clears_sustained_window():
     assert limiter.try_acquire("+1") == 0.0
 
 
-def test_slots_above_sustained_max_raise_instead_of_indexerror():
+def test_slots_above_max_calls_defer_without_raising():
+    """Issue #7: an unfulfillable request defers, it does not raise.
+
+    The contract is "try_acquire never sleeps and never raises" — slots above
+    ``max_calls`` used to break it with ValueError. No wait can make a window
+    hold more than ``max_calls`` entries, so the defer is a state-independent
+    full-window cadence that repeats until the caller splits the request, and
+    the refused ask reserves nothing.
+    """
+    clock = _FakeClock()
+    limiter = _limiter(clock, max_calls=3, window=60.0)
+
+    assert limiter.try_acquire_many("+1", 4) == 60.0
+    assert limiter.used("+1") == 0  # a deferral reserves nothing
+    assert limiter.peek_many("+1", 4) == 60.0  # the peek half agrees
+    # Window state is irrelevant: empty or busy, the cadence defer repeats.
+    clock.advance(60.0)
+    assert limiter.try_acquire_many("+1", 4) == 60.0
+    # Satisfiable requests stay untouched by the refused oversized ones.
+    assert limiter.try_acquire_many("+1", 2) == 0.0
+
+
+def test_slots_above_sustained_max_defer_instead_of_raising():
+    """Issue #7: slots above a tier cap defer at the wider tier's cadence.
+
+    The old ValueError (itself a fix for an IndexError on an empty window)
+    broke the never-raises contract. The sustained window is the wider tier,
+    so its cadence wins the max() against the burst cadence."""
     limiter = _tiered(_TieredFakeClock(), sustained_calls=5)
+    assert limiter.try_acquire_many("+1", 6) == 3600.0
+    assert limiter.used("+1") == 0
+
+
+def test_record_many_still_rejects_slots_above_tier_caps():
+    """Commit-side guard stays loud (#7): record_many commits a peek-admitted
+    request, so an oversized one there is a programming error like slots<1 —
+    recording it would widen the window and corrupt every later defer."""
+    limiter = _tiered(_TieredFakeClock(), sustained_calls=5)
+    with pytest.raises(ValueError, match="max_calls"):
+        limiter.record_many("+1", 21)  # above the burst cap of 20
     with pytest.raises(ValueError, match="sustained_max_calls"):
-        limiter.try_acquire_many("+1", 6)
+        limiter.record_many("+1", 6)  # above the sustained cap of 5
 
 
 def test_non_positive_window_is_rejected():
