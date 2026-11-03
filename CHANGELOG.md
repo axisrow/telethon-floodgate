@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- `TelegramRateLimitGate.try_acquire(..., peer=...)` no longer records a
+  phantom per-peer slot when the account-wide category refuses (#8): the
+  peer+category composition is now two-phase — both windows are peeked
+  without recording and committed only when both admit, so a deferral
+  reserves nothing anywhere. Previously every category-refused retry burned a
+  peer slot, shifting the real send by another peer window during adaptive
+  backoff. Peer-first defer ordering (a peer refusal leaves the category
+  untouched) and `slots=n` all-or-nothing semantics are unchanged;
+  `ResolveRateLimiter` exposes the halves as `peek_many` / `record_many`.
 - `scripts/calibrate_send_limits.py`: a point cut short by the
   `--max-messages`/`--max-seconds` budget no longer counts as a flood-free
   interval (#9) — with the old clean-filter (only `flooded`/`sent > 0`

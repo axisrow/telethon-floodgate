@@ -373,15 +373,28 @@ class TelegramRateLimitGate:
         # A reported flood scales every defer for this phone until the events
         # decay; 0.0 stays 0.0 — backoff slows callers, it invents nothing.
         multiplier = self._flood_multiplier(phone)
-        if peer is not None:
-            peer_retry_after = self._try_acquire_peer(phone, category, peer, slots)
+        limiter = self._limiters.get(category, self._limiters["default"])
+        # Two-phase composition (#8): "deferral reserves nothing" must hold for
+        # the peer+category pair too, so both windows are peeked first and
+        # recorded only when both admit. Synchronous code with no await between
+        # peek and commit — atomic on the single event loop by construction.
+        peer_limiter = (
+            self._peer_bucket(phone, category, peer) if peer is not None else None
+        )
+        if peer_limiter is not None:
+            peer_retry_after = peer_limiter.peek_many(phone, slots)
             if peer_retry_after > 0:
                 # The tighter per-peer bucket refused first and its slot for
                 # the broad category is left untouched, so a burst aimed at
                 # one peer cannot burn the account-wide budget.
                 return peer_retry_after * multiplier
-        limiter = self._limiters.get(category, self._limiters["default"])
-        return limiter.try_acquire_many(phone, slots) * multiplier
+        category_retry_after = limiter.peek_many(phone, slots)
+        if category_retry_after > 0:
+            return category_retry_after * multiplier
+        if peer_limiter is not None:
+            peer_limiter.record_many(phone, slots)
+        limiter.record_many(phone, slots)
+        return 0.0
 
     async def acquire(
         self,
@@ -465,19 +478,20 @@ class TelegramRateLimitGate:
         kind = peer.split(":", 1)[0] if ":" in peer else ""
         return self._peer_specs.get(f"{category}:{kind}")
 
-    def _try_acquire_peer(
-        self, phone: str, category: str, peer: str, slots: int
-    ) -> float:
-        """Reserve a slot in the (phone, category, peer) bucket.
+    def _peer_bucket(
+        self, phone: str, category: str, peer: str
+    ) -> ResolveRateLimiter | None:
+        """Return the (phone, category, peer) bucket, creating it lazily.
 
-        Returns ``0.0`` when allowed (and records it) or the seconds to defer.
-        Buckets are created lazily and kept in LRU order, bounded by
-        ``peer_max_buckets``; eviction may briefly re-allow an idle peer — the
-        bound trades that for a hard cap on memory.
+        Buckets are kept in LRU order, bounded by ``peer_max_buckets``;
+        eviction may briefly re-allow an idle peer — the bound trades that for
+        a hard cap on memory. An unconfigured ``<category>:<kind>`` pair owns
+        no bucket (``None``), so passing a peer for it degrades to
+        category-only limiting — the safe default.
         """
         spec = self._peer_spec_for(category, peer)
         if spec is None:
-            return 0.0
+            return None
         key = (phone, category, peer)
         limiter = self._peer_buckets.get(key)
         if limiter is None:
@@ -497,7 +511,7 @@ class TelegramRateLimitGate:
                 self._peer_buckets.popitem(last=False)
         else:
             self._peer_buckets.move_to_end(key)
-        return limiter.try_acquire_many(phone, slots)
+        return limiter
 
 
 class _MessageGateClient:

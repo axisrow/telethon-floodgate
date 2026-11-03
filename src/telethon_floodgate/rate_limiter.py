@@ -144,15 +144,7 @@ class ResolveRateLimiter:
         """
         return self.try_acquire_many(phone, 1)
 
-    def try_acquire_many(self, phone: str, slots: int) -> float:
-        """Atomically reserve ``slots`` calls for one compound operation.
-
-        With a sustained tier configured, both windows are checked first and
-        timestamps are recorded in both **only when both admit the call** —
-        a deferred call burns no slots in any window (unlike composing two
-        separate limiter instances, where a burst refusal after a sustained
-        admission would burn a sustained slot).
-        """
+    def _validate_slots(self, slots: int) -> int:
         slots = int(slots)
         if slots < 1:
             raise ValueError("slots must be at least 1")
@@ -162,46 +154,84 @@ class ResolveRateLimiter:
             # Same contract as the burst check: without it, slots above the
             # sustained cap indexed an empty window and raised IndexError.
             raise ValueError("slots cannot exceed sustained_max_calls")
+        return slots
 
-        now = self._time()
+    def _jittered_defer(self, retry: float) -> float:
+        if self._jitter_sec:
+            retry += self._jitter(0.0, self._jitter_sec)
+        return max(retry, 0.0)
+
+    def _peek_retry(self, phone: str, slots: int, now: float) -> float | None:
+        """Defer the request would get if made at ``now`` — or None if admitted.
+
+        Prunes both windows, records nothing. When BOTH windows are full, the
+        sustained retry (~hours) is the honest defer — returning the ~60s
+        burst retry here would wake every deferred caller one extra cycle per
+        window (review finding on tg_content_factory#1498).
+        """
         window = self._prune(phone, now)
-        burst_full = len(window) + slots > self._max_calls
-
-        # Sustained first: when BOTH windows are full, the sustained retry
-        # (~hours) is the honest defer — returning the ~60s burst retry here
-        # would wake every deferred caller one extra cycle per window
-        # (review finding on tg_content_factory#1498).
-        sustained_window: deque[float] | None = None
-        sustained_retry: float | None = None
+        retry: float | None = None
+        if len(window) + slots > self._max_calls:
+            # Wait until enough calls have expired for the whole atomic request,
+            # not merely until the oldest call leaves the window.
+            calls_to_expire = len(window) + slots - self._max_calls
+            retry = max((window[calls_to_expire - 1] + self._window_sec) - now, 0.0)
         if self._sustained_calls is not None:
             sustained_window = self._prune_window(
                 self._sustained_calls, phone, now, self._sustained_window_sec
             )
             if len(sustained_window) + slots > self._sustained_max_calls:
                 calls_to_expire = len(sustained_window) + slots - self._sustained_max_calls
-                sustained_retry = (
-                    sustained_window[calls_to_expire - 1] + self._sustained_window_sec
-                ) - now
+                sustained_retry = max(
+                    (sustained_window[calls_to_expire - 1] + self._sustained_window_sec) - now,
+                    0.0,
+                )
+                retry = sustained_retry if retry is None else max(retry, sustained_retry)
+        return retry
 
-        if burst_full:
-            # Wait until enough calls have expired for the whole atomic request,
-            # not merely until the oldest call leaves the window.
-            calls_to_expire = len(window) + slots - self._max_calls
-            retry_after = (window[calls_to_expire - 1] + self._window_sec) - now
-            if sustained_retry is not None:
-                retry_after = max(retry_after, sustained_retry)
-            if self._jitter_sec:
-                retry_after += self._jitter(0.0, self._jitter_sec)
-            return max(retry_after, 0.0)
-        if sustained_retry is not None:
-            retry = sustained_retry
-            if self._jitter_sec:
-                retry += self._jitter(0.0, self._jitter_sec)
-            return max(retry, 0.0)
+    def peek_many(self, phone: str, slots: int) -> float:
+        """The defer ``try_acquire_many(phone, slots)`` would return — no record.
 
-        window.extend([now] * slots)
-        if sustained_window is not None:
-            sustained_window.extend([now] * slots)
+        The peek half of the two-phase peek/commit pair (issue #8): the gate
+        peeks its peer and category windows first and commits only when every
+        one admits, so a refused call burns no slot anywhere.
+        """
+        slots = self._validate_slots(slots)
+        retry = self._peek_retry(phone, slots, self._time())
+        if retry is None:
+            return 0.0
+        return self._jittered_defer(retry)
+
+    def record_many(self, phone: str, slots: int) -> None:
+        """Record ``slots`` calls without checking the window.
+
+        The commit half of the pair: the gate calls it only after every window
+        admitted, so it cannot refuse. Gate code is synchronous with no await
+        between peek and commit, so on the single event loop the pair is
+        atomic by construction.
+        """
+        slots = self._validate_slots(slots)
+        now = self._time()
+        self._prune(phone, now).extend([now] * slots)
+        if self._sustained_calls is not None:
+            self._prune_window(
+                self._sustained_calls, phone, now, self._sustained_window_sec
+            ).extend([now] * slots)
+
+    def try_acquire_many(self, phone: str, slots: int) -> float:
+        """Atomically reserve ``slots`` calls for one compound operation.
+
+        With a sustained tier configured, both windows are checked first and
+        timestamps are recorded in both **only when both admit the call** —
+        a deferred call burns no slots in any window (unlike composing two
+        separate limiter instances, where a burst refusal after a sustained
+        admission would burn a sustained slot).
+        """
+        slots = self._validate_slots(slots)
+        retry = self._peek_retry(phone, slots, self._time())
+        if retry is not None:
+            return self._jittered_defer(retry)
+        self.record_many(phone, slots)
         return 0.0
 
     def used(self, phone: str) -> int:
