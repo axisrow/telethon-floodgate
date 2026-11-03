@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
 
 from telethon_floodgate.rate_limit_gate import (
+    _WARNED_UNKNOWN_OPERATIONS,
     RateLimitSpec,
     TelegramPeerRateLimitedError,
     TelegramRateLimitedError,
@@ -105,6 +107,34 @@ def test_phase_two_categories_are_separately_calibrated() -> None:
     # A history stream must not consume a write-operation slot.
     assert gate.try_acquire("+1", "history") == 0.0
     assert gate.try_acquire("+1", "send") == 0.0
+
+
+# --- unknown operation tags (#10) --------------------------------------------
+
+
+def test_unknown_operation_warns_once_per_tag(caplog) -> None:
+    """A typo'd or unregistered tag used to slip into the permissive default
+    bucket with zero signal (#10): warn the first time, then stay quiet — a
+    hot path must not spam one line per call."""
+    _WARNED_UNKNOWN_OPERATIONS.clear()
+    with caplog.at_level(logging.WARNING, logger="telethon_floodgate.rate_limit_gate"):
+        assert TelegramRateLimitGate.category_for("telegram_send_poll") == "default"
+        assert TelegramRateLimitGate.category_for("telegram_send_poll") == "default"
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    # The tag itself must be greppable from the message.
+    assert "telegram_send_poll" in warnings[0].getMessage()
+
+
+def test_registered_and_suffix_rescued_tags_never_warn(caplog) -> None:
+    """Suffix matching is an intentional rescue, not a fallback: registered
+    tags and decorated warm/sweep tags must stay silent."""
+    _WARNED_UNKNOWN_OPERATIONS.clear()
+    with caplog.at_level(logging.WARNING, logger="telethon_floodgate.rate_limit_gate"):
+        assert TelegramRateLimitGate.category_for("telegram_edit_admin") == "admin_action"
+        assert TelegramRateLimitGate.category_for("leave_channels:123_warm_dialog_cache") == "dialogs"
+        assert TelegramRateLimitGate.category_for("resume_stream_dialogs") == "dialog_sweep"
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
 
 
 def test_history_uses_empirical_window_with_conservative_margin() -> None:
