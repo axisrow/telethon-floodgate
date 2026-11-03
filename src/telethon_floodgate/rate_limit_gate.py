@@ -20,6 +20,7 @@ from typing import Any
 from telethon.requestiter import RequestIter
 from telethon.tl.functions import channels, messages
 
+from telethon_floodgate._errors import TelegramRateLimitedError
 from telethon_floodgate.flood_wait import TRANSIENT_FLOOD_WAIT_MAX_SEC
 from telethon_floodgate.rate_limiter import ResolveRateLimiter
 
@@ -66,14 +67,9 @@ def _effective_jitter(spec: RateLimitSpec) -> float:
     return spec.window_sec * 0.05 if spec.jitter_sec is None else spec.jitter_sec
 
 
-class TelegramRateLimitedError(RuntimeError):
-    """Raised when an operation is deferred before making a Telegram call."""
-
-    def __init__(self, phone: str, category: str, retry_after_sec: float) -> None:
-        super().__init__(f"Telegram {category} rate-limited for {phone}; retry in {retry_after_sec:.1f}s")
-        self.phone = phone
-        self.category = category
-        self.retry_after_sec = retry_after_sec
+# ``TelegramRateLimitedError`` moved to ``_errors`` (issue #11) so the
+# username-resolve limiter can subclass it without a circular import; this
+# import re-exports it and keeps every historical import path intact.
 
 
 class TelegramPeerRateLimitedError(TelegramRateLimitedError):
