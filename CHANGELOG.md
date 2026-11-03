@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- `UsernameResolveRateLimitedError` and `UsernameResolveFloodWaitDeferredError`
+  are now `TelegramRateLimitedError` subclasses instead of bare `RuntimeError`
+  siblings (#11). Backwards compatible: existing `except UsernameResolve*`
+  handlers keep working, historical message texts and attributes
+  (`retry_after_sec`, `retry_after_seconds`, `next_available_at`,
+  `run_after_with_buffer`, `wait_seconds`) are unchanged — and the shared
+  consumer handler `except TelegramRateLimitedError: operation unavailable,
+  move on` now covers resolve refusals too. `TelegramRateLimitedError` moved to
+  a private `_errors` module to avoid a circular import; the public import
+  paths (`rate_limit_gate`, package root) are re-exports and unchanged.
 - `TelegramRateLimitGate.try_acquire(..., peer=...)` no longer records a
   phantom per-peer slot when the account-wide category refuses (#8): the
   peer+category composition is now two-phase — both windows are peeked
