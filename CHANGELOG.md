@@ -61,6 +61,25 @@
   one-cooldown self-heal from 0.1.5, #14) and the claim release; a trial
   dying on a non-flood error stays covered by the existing ghost-probe test.
 
+## 0.2.0 (2026-11-05)
+
+- `ResolveRateLimiter` sustained tier is **on by default**: 60 calls / 3600s
+  alongside the 20/60s burst. The tier that was opt-in never turned itself
+  on, and a second deep FLOOD_WAIT (18h; tg_content_factory 2026-11-04) grew
+  out of sustained volume exactly like the 13.8h one on 2026-10-06 (#26).
+  The 0.1.x burst-only behaviour stays reachable via the explicit
+  `sustained_max_calls=None, sustained_window_sec=None` pair.
+- New `tighten(phone, *, factor, duration_sec)` (#26): after a Telegram-side
+  signal (rate limit / flood) on a phone, callers halve that phone's
+  effective sustained budget for a few hours instead of waiting the signal
+  out at full quota — Telegram escalates in steps, and full-quota waits
+  invite the next rung. Invalid arguments raise `ValueError`; without a
+  sustained tier `tighten` is a no-op returning `None`.
+- New `snapshot_state()` / `restore_state()` (#26): per-phone window contents
+  as wall-clock stamps, so a restarted daemon carries its sustained volume
+  across the restart (monotonic stamps die with the process; wall-clock ones
+  replay against the next boot's clock). Merges into existing state.
+
 ## 0.1.5 (2026-10-24)
 
 - `FloodCircuitBreaker.check()`: a HALF_OPEN-busy refusal (another coroutine's
