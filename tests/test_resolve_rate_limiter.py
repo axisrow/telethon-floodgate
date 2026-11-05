@@ -154,12 +154,17 @@ def test_sustained_tier_caps_accumulated_volume():
 
 
 def test_without_sustained_tier_volume_is_uncapped():
-    """Back-compat: no sustained params -> 0.1.x behaviour (burst only)."""
+    """Explicit opt-out (sustained_max_calls=None) -> 0.1.x burst-only.
+
+    Since #26 the ABSENCE of sustained params means the 60/3600s default, so
+    the legacy burst-only behaviour requires the explicit None pair."""
     clock = _TieredFakeClock()
     limiter = ResolveRateLimiter(
         max_calls=20,
         window_sec=60.0,
         jitter_sec=0.0,
+        sustained_max_calls=None,
+        sustained_window_sec=None,
         time_func=clock,
         jitter_func=lambda _a, _b: 0.0,
     )
@@ -200,10 +205,11 @@ def test_sustained_tier_is_per_account():
 
 
 def test_sustained_params_must_come_in_pair():
+    """#26 defaults fill both params; the pair rule guards EXPLICIT partial sets."""
     with pytest.raises(ValueError):
-        ResolveRateLimiter(sustained_max_calls=60)
+        ResolveRateLimiter(sustained_max_calls=60, sustained_window_sec=None)
     with pytest.raises(ValueError):
-        ResolveRateLimiter(sustained_window_sec=3600.0)
+        ResolveRateLimiter(sustained_max_calls=None, sustained_window_sec=3600.0)
 
 
 def test_sustained_window_cannot_be_narrower_than_burst():
@@ -315,3 +321,171 @@ def test_record_many_fills_both_windows_like_acquire():
     assert limiter.peek_many("+1", 1) > 0.0
     clock.now += 3540  # t=3600: the sustained window drained too
     assert limiter.try_acquire("+1") == 0.0
+
+
+def _default_limiter(clock: _FakeClock):
+    return ResolveRateLimiter(
+        time_func=clock,
+        jitter_func=lambda _a, _b: 0.0,
+    )
+
+
+def test_sustained_tier_is_on_by_default():
+    """#26: the tier that was opt-in never turned itself on — a second 18h
+    FLOOD_WAIT proved it. Defaults now carry the 60/3600s sustained budget."""
+    clock = _FakeClock()
+    limiter = _default_limiter(clock)
+    # Walk one call every 3.1s: the 20/60s burst window never fills, so any
+    # deferral past call #60 can only come from the default sustained tier.
+    for _ in range(60):
+        assert limiter.try_acquire("+1") == 0.0
+        clock.advance(3.1)
+    assert limiter.try_acquire("+1") > 0.0
+
+
+def test_explicit_none_still_disables_sustained_tier():
+    """0.1.x behaviour stays reachable for callers that deliberately opt out."""
+    clock = _FakeClock()
+    limiter = ResolveRateLimiter(
+        sustained_max_calls=None,
+        sustained_window_sec=None,
+        time_func=clock,
+        jitter_func=lambda _a, _b: 0.0,
+    )
+    for _ in range(100):
+        assert limiter.try_acquire("+1") == 0.0
+        clock.advance(3.1)
+
+
+def test_tighten_shrinks_sustained_budget_until_expiry():
+    clock = _FakeClock()
+    limiter = _default_limiter(clock)
+    assert limiter.tighten("+1") == 30  # 60 * 0.5, factory default factor
+
+    for _ in range(30):
+        assert limiter.try_acquire("+1") == 0.0
+        clock.advance(3.1)
+    # The tightened cap is exhausted long before the default 60 would be.
+    assert limiter.try_acquire("+1") > 0.0
+
+    # After the tightening duration the configured budget returns (and the
+    # 4h slide has pruned the whole hour-long window).
+    clock.advance(4 * 3600)
+    assert limiter.try_acquire("+1") == 0.0
+
+
+def test_tighten_is_per_account():
+    clock = _FakeClock()
+    limiter = _default_limiter(clock)
+    limiter.tighten("+1")
+    # A tightened phone must not shrink anybody else's budget.
+    for _ in range(60):
+        assert limiter.try_acquire("+2") == 0.0
+        clock.advance(3.1)
+    assert limiter.try_acquire("+2") > 0.0  # default sustained cap for +2
+    for _ in range(30):
+        assert limiter.try_acquire("+1") == 0.0
+        clock.advance(3.1)
+    assert limiter.try_acquire("+1") > 0.0  # tightened cap for +1
+
+
+def test_tighten_rejects_degenerate_arguments():
+    limiter = _default_limiter(_FakeClock())
+    with pytest.raises(ValueError, match="factor"):
+        limiter.tighten("+1", factor=0)
+    with pytest.raises(ValueError, match="factor"):
+        limiter.tighten("+1", factor=1.5)
+    with pytest.raises(ValueError, match="duration_sec"):
+        limiter.tighten("+1", duration_sec=0)
+
+
+def test_tighten_without_sustained_tier_is_a_no_op():
+    limiter = ResolveRateLimiter(
+        sustained_max_calls=None,
+        sustained_window_sec=None,
+        time_func=_FakeClock(),
+        jitter_func=lambda _a, _b: 0.0,
+    )
+    assert limiter.tighten("+1") is None
+
+
+def test_snapshot_restore_keeps_volume_across_replacement():
+    """A restarted daemon builds a fresh limiter whose monotonic clock restarted
+    with it; wall-clock stamps must carry the sustained volume over (#26)."""
+    clock = _FakeClock()
+    limiter = _default_limiter(clock)
+    for _ in range(40):
+        assert limiter.try_acquire("+1") == 0.0
+        clock.advance(3.1)
+
+    snapshot = limiter.snapshot_state()
+    # A "restarted" limiter: fresh instance, fresh monotonic clock.
+    revived = _default_limiter(_FakeClock())
+    revived.restore_state(snapshot)
+    # The carried volume still throttles: 19 burst stamps + this call fill the
+    # inclusive 20-call burst cap, so the NEXT call defers (the sustained
+    # window travels too — 40 of 60 slots).
+    assert revived.try_acquire("+1") == 0.0
+    assert revived.try_acquire("+1") > 0.0
+    # 40 carried + the fresh allowed call = 41 in the sustained window.
+    assert len(revived._sustained_calls["+1"]) == 41
+
+
+def test_restore_replays_wall_clock_stamps_deterministically():
+    import time as time_module
+
+    clock = _FakeClock()
+    limiter = ResolveRateLimiter(
+        max_calls=3,
+        window_sec=60.0,
+        time_func=clock,
+        jitter_func=lambda _a, _b: 0.0,
+    )
+    now_wall = time_module.time()
+    limiter.restore_state({
+        "+1": {
+            "burst": [now_wall - 10, now_wall - 30],
+            "sustained": [now_wall - 10, now_wall - 30],
+            "tightened": {"cap": 30, "expires_in": 3600},
+        },
+    })
+    # Two carried slots (ages 10s/30s): the cap is inclusive — the third call
+    # is admitted, the FOURTH defers on the burst window.
+    assert limiter.try_acquire("+1") == 0.0
+    assert limiter.try_acquire("+1") > 0.0
+    # And the tightened budget travelled: the sustained cap is 30, not 60.
+    assert limiter._effective_sustained_cap("+1", clock.now) == 30
+
+
+def test_restore_decays_already_elapsed_tightening():
+
+    limiter = _default_limiter(_FakeClock())
+    limiter.restore_state({
+        "+1": {"tightened": {"cap": 30, "expires_in": 0}},
+    })
+    # expires_in 0 means the tightening already burnt out in wall-clock terms.
+    assert limiter._effective_sustained_cap("+1", 1000.0) == 60
+
+
+def test_restore_into_live_window_stays_sorted_and_pruned():
+    """Merging into a limiter that already served traffic (review finding).
+
+    The merged deque must stay ascending: the front-only prune and the
+    ``window[calls_to_expire - 1]`` index both assume it. Appending snapshot
+    stamps behind newer live stamps used to strand a dead stamp mid-deque,
+    inflating ``used()`` and shifting defers for up to a full window."""
+    clock = _FakeClock()
+    limiter = _default_limiter(clock)
+    assert limiter.try_acquire("+1") == 0.0  # live stamp at t=1000
+    clock.advance(30)
+    assert limiter.try_acquire("+1") == 0.0  # live stamp at t=1030
+
+    # Snapshot stamps convert to mono 1025 and 990 — one interleaves between
+    # the live stamps, one is older than everything live.
+    import time as time_module
+
+    now_wall = time_module.time()
+    limiter.restore_state({"+1": {"burst": [now_wall - 5, now_wall - 40]}})
+
+    clock.advance(40)  # t=1070: cutoff 1010 evicts 990 and 1000, keeps 1025/1030
+    assert limiter.used("+1") == 2  # unsorted merge would strand 990 -> 3

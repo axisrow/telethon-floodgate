@@ -262,7 +262,9 @@ class TelegramRateLimitGate:
         # note_flood doubles the defers this gate hands out for that phone
         # until the events decay out of the window. Static windows assume the
         # calibration holds; a server-side flood is proof it currently does
-        # not. Opt-in — it changes returned defers — like the sustained tier.
+        # not. Opt-in — it changes returned defers, and unlike the sustained
+        # tier (default-on since #26), backoff arms only when the gate is
+        # built with flood_backoff=True.
         self._flood_backoff = flood_backoff
         self._flood_backoff_cap = float(flood_backoff_cap)
         self._flood_decay_sec = float(flood_decay_sec)

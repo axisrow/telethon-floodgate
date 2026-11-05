@@ -19,6 +19,7 @@ import time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from math import ceil, isfinite
+from typing import Any
 
 from telethon_floodgate._errors import TelegramRateLimitedError
 
@@ -28,6 +29,17 @@ from telethon_floodgate._errors import TelegramRateLimitedError
 DEFAULT_MAX_CALLS = 20
 DEFAULT_WINDOW_SEC = 60.0
 DEFAULT_JITTER_SEC = 5.0
+# Sustained defaults (#26): 60/3600s is the honest companion to the 20/60s
+# burst in production — both deep floods on record (2026-10-06 13.8h,
+# 2026-11-04 18h) grew out of sustained volume, not bursts. The tier used to
+# be opt-in; a second 18h FLOOD_WAIT proved opt-in never turns itself on.
+DEFAULT_SUSTAINED_MAX_CALLS = 60
+DEFAULT_SUSTAINED_WINDOW_SEC = 3600.0
+# Adaptive tightening (#26): after a Telegram-side signal the phone has
+# demonstrated the static budget outruns its tolerance — halve the sustained
+# budget for a few hours instead of waiting the signal out at full quota.
+DEFAULT_TIGHTEN_FACTOR = 0.5
+DEFAULT_TIGHTEN_DURATION_SEC = 4 * 3600.0
 RESOLVE_USERNAME_BACKOFF_BUFFER_SEC = 5
 GLOBAL_RESOLVE_BACKOFF_THRESHOLD_SEC = 300
 
@@ -103,8 +115,8 @@ class ResolveRateLimiter:
         jitter_sec: float = DEFAULT_JITTER_SEC,
         time_func=time.monotonic,
         jitter_func=random.uniform,
-        sustained_max_calls: int | None = None,
-        sustained_window_sec: float | None = None,
+        sustained_max_calls: int | None = DEFAULT_SUSTAINED_MAX_CALLS,
+        sustained_window_sec: float | None = DEFAULT_SUSTAINED_WINDOW_SEC,
     ) -> None:
         self._max_calls = max(1, int(max_calls))
         self._window_sec = float(window_sec)
@@ -144,6 +156,9 @@ class ResolveRateLimiter:
         else:
             self._sustained_max_calls = 0
             self._sustained_window_sec = 0.0
+        # phone → (effective sustained cap, expiry in limiter time); fed by
+        # ``tighten`` after Telegram-side signals (#26).
+        self._tightened: dict[str, tuple[int, float]] = {}
 
     def _prune_window(
         self, store: dict[str, deque[float]], phone: str, now: float, window_sec: float
@@ -206,11 +221,14 @@ class ResolveRateLimiter:
             sustained_window = self._prune_window(
                 self._sustained_calls, phone, now, self._sustained_window_sec
             )
+            # The cap the phone currently earns: the configured budget, shrunk
+            # while a ``tighten`` from a Telegram-side signal is in effect (#26).
+            sustained_cap = self._effective_sustained_cap(phone, now)
             sustained_retry: float | None = None
-            if slots > self._sustained_max_calls:
+            if slots > sustained_cap:
                 sustained_retry = self._sustained_window_sec
-            elif len(sustained_window) + slots > self._sustained_max_calls:
-                calls_to_expire = len(sustained_window) + slots - self._sustained_max_calls
+            elif len(sustained_window) + slots > sustained_cap:
+                calls_to_expire = len(sustained_window) + slots - sustained_cap
                 sustained_retry = max(
                     (sustained_window[calls_to_expire - 1] + self._sustained_window_sec) - now,
                     0.0,
@@ -277,6 +295,146 @@ class ResolveRateLimiter:
         self.record_many(phone, slots)
         return 0.0
 
+    def tighten(
+        self,
+        phone: str,
+        *,
+        factor: float = DEFAULT_TIGHTEN_FACTOR,
+        duration_sec: float = DEFAULT_TIGHTEN_DURATION_SEC,
+    ) -> int | None:
+        """Shrink the sustained budget for ``phone`` after a Telegram signal.
+
+        Telegram escalates in steps (short waits → rate limits → deep
+        multi-hour floods); a phone that earned such a signal has proven the
+        static budget outruns its current tolerance, and waiting the signal
+        out at full quota only invites the next rung (#26). For
+        ``duration_sec`` of limiter time the effective sustained cap becomes
+        ``round(sustained_max_calls * factor)`` (min 1), after which the
+        configured budget returns on its own.
+
+        Returns the new effective cap, or ``None`` when the sustained tier is
+        disabled (nothing to tighten). Invalid arguments raise ``ValueError``.
+        """
+        if not 0.0 < factor <= 1.0:
+            raise ValueError(f"factor must be in (0, 1]: got {factor}")
+        if not isfinite(duration_sec) or duration_sec <= 0:
+            raise ValueError(f"duration_sec must be finite and > 0: got {duration_sec}")
+        if self._sustained_calls is None:
+            return None
+        effective_cap = max(1, round(self._sustained_max_calls * factor))
+        self._tightened[phone] = (effective_cap, self._time() + duration_sec)
+        return effective_cap
+
+    def _effective_sustained_cap(self, phone: str, now: float) -> int:
+        """Configured sustained cap, shrunk while a tightening is in effect."""
+        if self._sustained_calls is None:
+            return 0
+        entry = self._tightened.get(phone)
+        if entry is not None:
+            effective_cap, expiry = entry
+            if now >= expiry:
+                self._tightened.pop(phone, None)
+            else:
+                return min(self._sustained_max_calls, effective_cap)
+        return self._sustained_max_calls
+
+    def snapshot_state(self) -> dict[str, dict[str, Any]]:
+        """Export per-phone window contents as wall-clock stamps.
+
+        Stamps (``time.time()``) make the snapshot portable across processes:
+        monotonic stamps die with the process, but ``restore_state`` replays
+        wall-clock stamps against the next boot's clock, so sustained volume
+        stays honest across a daemon restart (#26). Tightened budgets travel
+        too, as remaining seconds.
+        """
+        now_mono = self._time()
+        now_wall = time.time()
+        phones = set(self._calls) | set(self._sustained_calls or {})
+        snapshot: dict[str, dict[str, Any]] = {}
+        for phone in phones:
+            entry: dict[str, Any] = {
+                "burst": [now_wall - (now_mono - t) for t in self._prune(phone, now_mono)]
+            }
+            if self._sustained_calls is not None:
+                sustained = self._prune_window(
+                    self._sustained_calls, phone, now_mono, self._sustained_window_sec
+                )
+                entry["sustained"] = [now_wall - (now_mono - t) for t in sustained]
+            tight = self._tightened.get(phone)
+            if tight is not None:
+                entry["tightened"] = {
+                    "cap": tight[0],
+                    "expires_in": max(0.0, tight[1] - now_mono),
+                }
+            snapshot[phone] = entry
+        return snapshot
+
+    def _merge_stamps(
+        self,
+        live,
+        snapshot_stamps,
+        now_mono: float,
+        now_wall: float,
+        window_sec: float,
+    ) -> list[float]:
+        """Merge snapshot stamps into a live window: sorted, expired dropped.
+
+        A deque that just absorbed a restore must stay ascending.
+        ``_prune_window`` pops only from the front, so a stale stamp parked
+        behind a fresh one would evade pruning and inflate ``len(window)`` —
+        wrongful deferrals for up to a full window — and ``_peek_retry``
+        indexes ``window[calls_to_expire - 1]`` assuming ascending order.
+        """
+        cutoff = now_mono - window_sec
+        stamps = [
+            t
+            for t in (
+                *live,
+                *(now_mono - (now_wall - float(s)) for s in snapshot_stamps),
+            )
+            if t > cutoff
+        ]
+        stamps.sort()
+        return stamps
+
+    def restore_state(self, snapshot: dict[str, dict[str, Any]]) -> None:
+        """Replay a :meth:`snapshot_state` export into this limiter.
+
+        Wall-clock stamps convert back against this process's monotonic clock;
+        entries older than their window are dropped, and the merge into
+        existing state is kept sorted (see :meth:`_merge_stamps` — both the
+        prune and the retry math need ascending stamps). Tightened budgets
+        whose duration already elapsed in wall-clock terms decay the same
+        way. Merges into existing state.
+        """
+        now_mono = self._time()
+        now_wall = time.time()
+        for phone, entry in snapshot.items():
+            self._calls[phone] = deque(
+                self._merge_stamps(
+                    self._calls.get(phone, ()),
+                    entry.get("burst", ()),
+                    now_mono,
+                    now_wall,
+                    self._window_sec,
+                )
+            )
+            sustained = entry.get("sustained")
+            if sustained is not None and self._sustained_calls is not None:
+                self._sustained_calls[phone] = deque(
+                    self._merge_stamps(
+                        self._sustained_calls.get(phone, ()),
+                        sustained,
+                        now_mono,
+                        now_wall,
+                        self._sustained_window_sec,
+                    )
+                )
+            tight = entry.get("tightened")
+            if tight is not None and self._sustained_calls is not None:
+                cap, expires_in = tight["cap"], tight["expires_in"]
+                self._tightened[phone] = (int(cap), now_mono + max(0.0, float(expires_in)))
+
     def used(self, phone: str) -> int:
         """Burst-window calls recorded for ``phone`` (prunes first).
 
@@ -290,7 +448,12 @@ class ResolveRateLimiter:
         return len(self._prune(phone, self._time()))
 
     def reset(self, phone: str | None = None) -> None:
-        """Drop recorded history for ``phone`` (or all accounts)."""
+        """Drop recorded history for ``phone`` (or all accounts).
+
+        Recorded *history* only: a ``tighten`` budget (#26) is a decision, not
+        history — it stays in force until its duration expires even across a
+        reset.
+        """
         if phone is None:
             self._calls.clear()
             if self._sustained_calls is not None:
