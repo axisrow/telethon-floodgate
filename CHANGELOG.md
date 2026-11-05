@@ -61,7 +61,7 @@
   one-cooldown self-heal from 0.1.5, #14) and the claim release; a trial
   dying on a non-flood error stays covered by the existing ghost-probe test.
 
-## 0.2.0 (2026-11-05)
+## 0.1.6 (2026-11-05)
 
 - `ResolveRateLimiter` sustained tier is **on by default**: 60 calls / 3600s
   alongside the 20/60s burst. The tier that was opt-in never turned itself
