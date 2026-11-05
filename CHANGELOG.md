@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.6 (2026-11-05)
 
 - `try_acquire(..., slots=n)` with `n` above a bucket's `max_calls` (for
   example a 2-message album against the 1-slot `send:user` peer bucket, or
@@ -60,8 +60,6 @@
   cancellation trigger (a trial cancelled mid-await recovering through the
   one-cooldown self-heal from 0.1.5, #14) and the claim release; a trial
   dying on a non-flood error stays covered by the existing ghost-probe test.
-
-## 0.1.6 (2026-11-05)
 
 - `ResolveRateLimiter` sustained tier is **on by default**: 60 calls / 3600s
   alongside the 20/60s burst. The tier that was opt-in never turned itself
