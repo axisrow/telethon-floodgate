@@ -369,23 +369,66 @@ class ResolveRateLimiter:
             snapshot[phone] = entry
         return snapshot
 
+    def _merge_stamps(
+        self,
+        live,
+        snapshot_stamps,
+        now_mono: float,
+        now_wall: float,
+        window_sec: float,
+    ) -> list[float]:
+        """Merge snapshot stamps into a live window: sorted, expired dropped.
+
+        A deque that just absorbed a restore must stay ascending.
+        ``_prune_window`` pops only from the front, so a stale stamp parked
+        behind a fresh one would evade pruning and inflate ``len(window)`` —
+        wrongful deferrals for up to a full window — and ``_peek_retry``
+        indexes ``window[calls_to_expire - 1]`` assuming ascending order.
+        """
+        cutoff = now_mono - window_sec
+        stamps = [
+            t
+            for t in (
+                *live,
+                *(now_mono - (now_wall - float(s)) for s in snapshot_stamps),
+            )
+            if t > cutoff
+        ]
+        stamps.sort()
+        return stamps
+
     def restore_state(self, snapshot: dict[str, dict[str, Any]]) -> None:
         """Replay a :meth:`snapshot_state` export into this limiter.
 
         Wall-clock stamps convert back against this process's monotonic clock;
-        entries older than their window are dropped by the regular prune on
-        the next acquire. Tightened budgets whose duration already elapsed in
-        wall-clock terms decay the same way. Merges into existing state.
+        entries older than their window are dropped, and the merge into
+        existing state is kept sorted (see :meth:`_merge_stamps` — both the
+        prune and the retry math need ascending stamps). Tightened budgets
+        whose duration already elapsed in wall-clock terms decay the same
+        way. Merges into existing state.
         """
         now_mono = self._time()
         now_wall = time.time()
         for phone, entry in snapshot.items():
-            for stamp in entry.get("burst", ()):
-                self._calls[phone].append(now_mono - (now_wall - float(stamp)))
+            self._calls[phone] = deque(
+                self._merge_stamps(
+                    self._calls.get(phone, ()),
+                    entry.get("burst", ()),
+                    now_mono,
+                    now_wall,
+                    self._window_sec,
+                )
+            )
             sustained = entry.get("sustained")
             if sustained is not None and self._sustained_calls is not None:
-                self._sustained_calls[phone].extend(
-                    now_mono - (now_wall - float(stamp)) for stamp in sustained
+                self._sustained_calls[phone] = deque(
+                    self._merge_stamps(
+                        self._sustained_calls.get(phone, ()),
+                        sustained,
+                        now_mono,
+                        now_wall,
+                        self._sustained_window_sec,
+                    )
                 )
             tight = entry.get("tightened")
             if tight is not None and self._sustained_calls is not None:
@@ -405,7 +448,12 @@ class ResolveRateLimiter:
         return len(self._prune(phone, self._time()))
 
     def reset(self, phone: str | None = None) -> None:
-        """Drop recorded history for ``phone`` (or all accounts)."""
+        """Drop recorded history for ``phone`` (or all accounts).
+
+        Recorded *history* only: a ``tighten`` budget (#26) is a decision, not
+        history — it stays in force until its duration expires even across a
+        reset.
+        """
         if phone is None:
             self._calls.clear()
             if self._sustained_calls is not None:

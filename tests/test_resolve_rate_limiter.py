@@ -465,3 +465,27 @@ def test_restore_decays_already_elapsed_tightening():
     })
     # expires_in 0 means the tightening already burnt out in wall-clock terms.
     assert limiter._effective_sustained_cap("+1", 1000.0) == 60
+
+
+def test_restore_into_live_window_stays_sorted_and_pruned():
+    """Merging into a limiter that already served traffic (review finding).
+
+    The merged deque must stay ascending: the front-only prune and the
+    ``window[calls_to_expire - 1]`` index both assume it. Appending snapshot
+    stamps behind newer live stamps used to strand a dead stamp mid-deque,
+    inflating ``used()`` and shifting defers for up to a full window."""
+    clock = _FakeClock()
+    limiter = _default_limiter(clock)
+    assert limiter.try_acquire("+1") == 0.0  # live stamp at t=1000
+    clock.advance(30)
+    assert limiter.try_acquire("+1") == 0.0  # live stamp at t=1030
+
+    # Snapshot stamps convert to mono 1025 and 990 — one interleaves between
+    # the live stamps, one is older than everything live.
+    import time as time_module
+
+    now_wall = time_module.time()
+    limiter.restore_state({"+1": {"burst": [now_wall - 5, now_wall - 40]}})
+
+    clock.advance(40)  # t=1070: cutoff 1010 evicts 990 and 1000, keeps 1025/1030
+    assert limiter.used("+1") == 2  # unsorted merge would strand 990 -> 3
