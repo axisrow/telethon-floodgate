@@ -22,7 +22,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 import pytest
 from telethon import TelegramClient
@@ -77,8 +77,11 @@ def _parse_proxy_url(value: str) -> dict[str, Any]:
 
     Telethon's dict form maps 1:1 onto its ``Connection._parse_proxy``
     signature (string proxy types are resolved through python-socks, the
-    only proxy backend Telethon uses since 1.24). Errors name REAL_TG_PROXY
-    and never echo the offending value — it may carry credentials.
+    only proxy backend Telethon uses since 1.24). Credentials are
+    percent-decoded: urlsplit keeps ``%xx`` raw, but the proxy handshake
+    needs the verbatim secret, so ``p%40ss`` must arrive as ``p@ss``.
+    Errors name REAL_TG_PROXY and never echo the offending value — it may
+    carry credentials.
     """
 
     def bad(reason: str) -> ValueError:
@@ -100,12 +103,14 @@ def _parse_proxy_url(value: str) -> dict[str, Any]:
         raise bad("missing host")
     if port is None:
         raise bad("missing port")
+    username = split.username
+    password = split.password
     return {
         "proxy_type": scheme,
         "addr": hostname,
         "port": port,
-        "username": split.username,
-        "password": split.password,
+        "username": unquote(username) if username is not None else None,
+        "password": unquote(password) if password is not None else None,
     }
 
 

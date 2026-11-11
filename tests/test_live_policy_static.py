@@ -149,6 +149,12 @@ def test_real_tg_proxy_unset_or_empty_means_direct_route():
             {"proxy_type": "socks5", "addr": "proxy.example", "port": 1080, "username": "u", "password": "p"},
         ),
         (
+            # Credentials needing percent-encoding arrive verbatim decoded:
+            # urlsplit keeps %xx raw, the proxy handshake must get p@ss.
+            "http://u%2Fx:p%40ss@proxy.example:8080",
+            {"proxy_type": "http", "addr": "proxy.example", "port": 8080, "username": "u/x", "password": "p@ss"},
+        ),
+        (
             "socks4://10.0.0.1:1080",
             {"proxy_type": "socks4", "addr": "10.0.0.1", "port": 1080, "username": None, "password": None},
         ),
