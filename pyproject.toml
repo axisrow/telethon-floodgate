@@ -7,14 +7,14 @@ name = "telethon-floodgate"
 version = "0.1.7"
 description = "Flood-wait handling, proactive rate-limit gate and circuit breaker for Telethon user accounts"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{name = "Axisrow"}]
 requires-python = ">=3.11"
 keywords = ["telegram", "telethon", "flood-wait", "rate-limit", "floodwait", "mtproto"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
