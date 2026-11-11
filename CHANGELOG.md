@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.7 (unreleased)
+## 0.1.7 (2026-11-11)
 
 - Live harness (opt-in `tests_live/`) supports `REAL_TG_PROXY` (#31) —
   `scheme://[user:pass@]host:port` with schemes `socks4`/`socks5`/`http`,
