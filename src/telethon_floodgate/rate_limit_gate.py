@@ -126,17 +126,15 @@ _OPERATION_CATEGORIES = {
 _WARNED_UNKNOWN_OPERATIONS: set[str] = set()
 
 
-def _category_for_operation(operation: str) -> str:
-    """Return a category for both canonical and decorated operation tags.
+def _registered_category(operation: str) -> str | None:
+    """Exact or decorated-suffix category for ``operation``, else ``None``.
 
     Warm operations are decorated with the caller name (for example
     ``resolve_channel_warm_dialog_cache``) so that flood diagnostics retain
     their useful context.  Matching the stable suffix prevents those paths
-    from silently falling back to the broad default bucket.
-
-    A truly unknown tag keeps the backward-compatible ``default`` fallback,
-    but logs a warning the first time so a missed registration (or a typo)
-    surfaces in logs instead of running unlimited-in-practice (#10).
+    from silently falling back to the broad default bucket.  Strict mode
+    (``strict_categories=True``, #29) treats ``None`` — and only ``None`` —
+    as an unregistered tag.
     """
     exact = _OPERATION_CATEGORIES.get(operation)
     if exact is not None:
@@ -145,6 +143,45 @@ def _category_for_operation(operation: str) -> str:
         return "dialog_sweep"
     if operation.endswith("_warm_dialog_cache"):
         return "dialogs"
+    return None
+
+
+class TelegramUnregisteredOperationError(ValueError):
+    """Raised in strict mode when an operation tag has no registered category.
+
+    A configuration error, deliberately NOT a ``TelegramRateLimitedError``
+    subclass: the shared "operation unavailable, move on" refusal handler must
+    never absorb it.  The whole point of ``strict_categories=True`` (#29) is
+    that a missed registration stops the caller loudly instead of degrading
+    into the permissive ``default`` bucket — the degradation that let the
+    11.11.2026 retry storm (unregistered ``telegram_invoke_request`` /
+    ``telegram_fetch_me``) run the whole account pool into FloodWait.
+    """
+
+    def __init__(self, operation: str) -> None:
+        self.operation = operation
+        categories = ", ".join(sorted(set(_OPERATION_CATEGORIES.values())))
+        tags = ", ".join(sorted(_OPERATION_CATEGORIES))
+        super().__init__(
+            f"operation {operation!r} is not registered in _OPERATION_CATEGORIES "
+            "(strict_categories=True fails closed instead of the permissive "
+            "'default' bucket, #29). Registered categories: "
+            f"{categories}. Registered operation tags: {tags}. Register the "
+            "tag (or fix the typo) in _OPERATION_CATEGORIES, or drop "
+            "strict_categories to restore the warn-once permissive default."
+        )
+
+
+def _category_for_operation(operation: str) -> str:
+    """Return a category for both canonical and decorated operation tags.
+
+    A truly unknown tag keeps the backward-compatible ``default`` fallback,
+    but logs a warning the first time so a missed registration (or a typo)
+    surfaces in logs instead of running unlimited-in-practice (#10).
+    """
+    category = _registered_category(operation)
+    if category is not None:
+        return category
     if operation not in _WARNED_UNKNOWN_OPERATIONS:
         _WARNED_UNKNOWN_OPERATIONS.add(operation)
         logger.warning(
@@ -215,6 +252,7 @@ class TelegramRateLimitGate:
         flood_backoff: bool = False,
         flood_backoff_cap: float = 8.0,
         flood_decay_sec: float = 3600.0,
+        strict_categories: bool = False,
     ) -> None:
         if flood_backoff_cap < 1.0:
             raise ValueError(
@@ -269,6 +307,14 @@ class TelegramRateLimitGate:
         self._flood_backoff_cap = float(flood_backoff_cap)
         self._flood_decay_sec = float(flood_decay_sec)
         self._flood_events: dict[str, deque[float]] = defaultdict(deque)
+        # Strict mode (#29): fail closed on an unregistered operation tag —
+        # category_for raises TelegramUnregisteredOperationError instead of
+        # degrading into the permissive default bucket. Opt-in: integrations
+        # that register their tags turn it on, legacy consumers keep the
+        # warn-once permissive fallback unchanged. Enforcement lives at the
+        # tag→category resolution point only; try_acquire keeps its
+        # never-raises contract untouched.
+        self._strict_categories = bool(strict_categories)
         # Per-peer specs are keyed "<category>:<kind>" (e.g. "send:user"); the
         # kind prefix comes from the peer key built by telethon_floodgate.peer.
         # An unconfigured pair has no per-peer bucket, so passing a peer for it
@@ -295,9 +341,24 @@ class TelegramRateLimitGate:
         self._peer_max_buckets = max(1, int(peer_max_buckets))
         self._peer_buckets: OrderedDict[tuple[str, str, str], ResolveRateLimiter] = OrderedDict()
 
-    @staticmethod
-    def category_for(operation: str) -> str:
-        # resolve is explicitly a no-op category: ResolveGuardMixin owns it.
+    def category_for(self, operation: str) -> str:
+        """Resolve an operation tag to its gate category.
+
+        With ``strict_categories=True`` an unregistered tag raises
+        ``TelegramUnregisteredOperationError`` (fail closed, #29) instead of
+        returning the permissive ``default`` bucket; the decorated-suffix
+        rescue still resolves real registrations. Default (strict off) keeps
+        the #10 behavior: ``default`` plus a warn-once log. Raises only here,
+        at the resolution point — ``try_acquire`` receives an
+        already-resolved category and never raises. ``resolve`` and
+        ``reaction`` stay registered no-op categories: ResolveGuardMixin owns
+        them, strict mode does not change that.
+        """
+        if self._strict_categories:
+            category = _registered_category(operation)
+            if category is None:
+                raise TelegramUnregisteredOperationError(operation)
+            return category
         return _category_for_operation(operation)
 
     def note_flood(self, phone: str, seconds: float | None = None) -> float:

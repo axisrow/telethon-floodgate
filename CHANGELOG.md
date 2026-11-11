@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.1.7 (unreleased)
+
+- `TelegramRateLimitGate(strict_categories=True)` — opt-in fail-closed mode
+  for unregistered operation tags (#29). An unknown tag at
+  `gate.category_for(operation)` now raises the new
+  `TelegramUnregisteredOperationError` — with the offending tag, the full
+  registered categories/tags lists and the registration instructions —
+  instead of silently degrading into the permissive 1000/min `default`
+  bucket. That degradation is fail-open at exactly the wrong moment: in the
+  11.11.2026 production incident two unregistered tags
+  (`telegram_invoke_request`, `telegram_fetch_me`) bypassed the sustained
+  send budget and a ~530 fails/hour retry storm ran the whole account pool
+  into FloodWait. The warn-once log (#10) stays as the only guard for
+  permissive mode but is no longer its last line of defence.
+  - **Where strict raises, and why**: at the tag→category resolution point
+    (`category_for`), at call time — not at construction, not inside
+    `try_acquire`. The gate cannot enumerate the consumer's call-site tags
+    itself, so startup validation would need a separate tag-manifest
+    mechanism (issue variant 2 — not built); the resolution call is the
+    first place a miss is knowable, and a configuration error should fail
+    loudly on its first occurrence. `try_acquire` receives an
+    already-resolved *category*, so its documented never-sleeps-never-raises
+    contract is untouched; passing an unknown category literal there still
+    falls back to the `default` bucket as before.
+  - `TelegramUnregisteredOperationError` subclasses `ValueError`, NOT
+    `TelegramRateLimitedError`: it is a configuration error, not a refusal —
+    the shared "operation unavailable, move on" handler must never absorb it
+    (the refusal hierarchy is unchanged).
+  - The decorated-suffix rescue (`*_warm_dialog_cache` → `dialogs`,
+    `*_stream_dialogs` → `dialog_sweep`) keeps resolving real registrations
+    under strict mode; strict closes only the unknown-tag hole.
+  - Default is unchanged: `strict_categories=False` keeps the #10 behavior —
+    `default` bucket plus a warn-once log per tag. No default was loosened.
+  - API note: `category_for` is now an instance method (it consults the
+    gate's strict flag) instead of a `staticmethod`. The documented
+    `gate.category_for(operation)` call form is unchanged; class-level calls
+    `TelegramRateLimitGate.category_for(...)` must go through an instance
+    (or the private module-level resolver).
+- Version bump to 0.1.7 in `pyproject.toml` and `__init__.py`.
+
 ## 0.1.6 (2026-11-05)
 
 - `try_acquire(..., slots=n)` with `n` above a bucket's `max_calls` (for
