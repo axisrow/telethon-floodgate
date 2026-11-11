@@ -18,9 +18,11 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator
+from urllib.parse import unquote, urlsplit
 
 import pytest
 from telethon import TelegramClient
@@ -66,6 +68,72 @@ class LiveSandbox:
     peer: User  # the account itself: the Saved Messages send counterpart
 
 
+_PROXY_ENV = "REAL_TG_PROXY"
+_PROXY_SCHEMES = ("socks4", "socks5", "http")
+
+
+def _parse_proxy_url(value: str) -> dict[str, Any]:
+    """Parse ``scheme://[user:pass@]host:port`` into a Telethon proxy dict.
+
+    Telethon's dict form maps 1:1 onto its ``Connection._parse_proxy``
+    signature (string proxy types are resolved through python-socks, the
+    only proxy backend Telethon uses since 1.24). Credentials are
+    percent-decoded: urlsplit keeps ``%xx`` raw, but the proxy handshake
+    needs the verbatim secret, so ``p%40ss`` must arrive as ``p@ss``.
+    Errors name REAL_TG_PROXY and never echo the offending value — it may
+    carry credentials.
+    """
+
+    def bad(reason: str) -> ValueError:
+        return ValueError(
+            f"{_PROXY_ENV} is set but invalid: {reason}; expected "
+            "scheme://[user:pass@]host:port with scheme socks4/socks5/http"
+        )
+
+    try:
+        split = urlsplit(value)
+        port = split.port  # raises ValueError itself on a non-numeric port
+        hostname = split.hostname
+        scheme = split.scheme.lower()
+    except ValueError:
+        raise bad("not a parseable URL") from None
+    if scheme not in _PROXY_SCHEMES:
+        raise bad(f"unsupported scheme {scheme!r}")
+    if not hostname:
+        raise bad("missing host")
+    if port is None:
+        raise bad("missing port")
+    username = split.username
+    password = split.password
+    return {
+        "proxy_type": scheme,
+        "addr": hostname,
+        "port": port,
+        "username": unquote(username) if username is not None else None,
+        "password": unquote(password) if password is not None else None,
+    }
+
+
+def _proxy_from_env(environ: Mapping[str, str]) -> dict[str, Any] | None:
+    """The ``live_telegram`` proxy setting: REAL_TG_PROXY or ``None``.
+
+    Absent/empty means the direct route — the historical behavior, unchanged.
+    A set-but-missing python-socks must fail HERE, not later: Telethon only
+    warns ("proxy argument will be ignored") and silently falls back to the
+    direct route, which is exactly the failure mode issue #31 forbids —
+    the override exists precisely because the direct route is refused.
+    """
+    value = environ.get(_PROXY_ENV, "").strip()
+    if not value:
+        return None
+    if importlib.util.find_spec("python_socks") is None:
+        raise ValueError(
+            f"{_PROXY_ENV} is set but the python-socks package is not installed; "
+            "install the live extra: pip install 'telethon-floodgate[live]'"
+        )
+    return _parse_proxy_url(value)
+
+
 @pytest.fixture
 async def live_telegram() -> AsyncIterator[LiveSandbox]:
     """Connect a real account from the environment (function scope on purpose:
@@ -73,11 +141,23 @@ async def live_telegram() -> AsyncIterator[LiveSandbox]:
     fresh client per test keeps each ``get_dialogs()`` isolated — dialog-list
     floods were a real production incident class in the origin project).
     """
+    try:
+        proxy = _proxy_from_env(os.environ)
+    except ValueError as err:
+        pytest.fail(str(err), pytrace=False)
+    client_kwargs: dict[str, Any] = {
+        # Surface short floods instead of silently sleeping/retrying.
+        "flood_sleep_threshold": 0,
+    }
+    if proxy is not None:
+        # Unset REAL_TG_PROXY → no proxy kwarg at all: the exact pre-#31
+        # client construction, so the default path is bit-for-bit unchanged.
+        client_kwargs["proxy"] = proxy
     client = TelegramClient(
         StringSession(os.environ["REAL_TG_SESSION"]),
         int(os.environ["REAL_TG_API_ID"]),
         os.environ["REAL_TG_API_HASH"],
-        flood_sleep_threshold=0,  # Surface short floods instead of silently sleeping/retrying.
+        **client_kwargs,
     )
     await client.connect()
     try:

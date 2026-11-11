@@ -31,6 +31,8 @@ RUN_FLOODGATE_LIVE_TG=1 pytest tests_live -s            # level 1
 RUN_FLOODGATE_LIVE_TG=1 python scripts/calibrate_send_limits.py   # level 2: raw-boundary probe
 ```
 
+Opt-in proxy for the live harness: `REAL_TG_PROXY=scheme://[user:pass@]host:port` (schemes `socks4`/`socks5`/`http`; requires the `live` extra — `pip install 'telethon-floodgate[live]'` with python-socks; unset/empty = direct route, bad value = loud failure naming the variable).
+
 Safety contract for anything live: disposable account, sends only to Saved Messages (`"me"`), respect `--max-messages`/`--max-seconds` budgets, secrets via environment only. Markers: `live_tg_ro` (read-only) / `live_tg_send`. `tests/test_live_policy_static.py` enforces the harness invariants offline (marker registration, testpaths exclusion, no `REAL_TG_*` literals, full gate-policy matrix) — any change to the live harness must keep those green.
 
 ## Architecture
