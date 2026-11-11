@@ -11,6 +11,8 @@ from telethon_floodgate.rate_limit_gate import (
     TelegramPeerRateLimitedError,
     TelegramRateLimitedError,
     TelegramRateLimitGate,
+    TelegramUnregisteredOperationError,
+    _category_for_operation,
     _effective_jitter,
 )
 
@@ -76,7 +78,7 @@ def test_resolve_and_reaction_keep_their_existing_dedicated_gates() -> None:
     ),
 )
 def test_decorated_dialog_operations_use_the_dialogs_bucket(operation: str) -> None:
-    assert TelegramRateLimitGate.category_for(operation) == "dialogs"
+    assert _category_for_operation(operation) == "dialogs"
 
 
 @pytest.mark.parametrize(
@@ -90,8 +92,8 @@ def test_dialog_sweep_has_its_own_bucket(operation: str) -> None:
     sweep was always refused, so the sweep could never resume (#1359). The
     warm-up keeps its own strict bucket — that is what #1330 needs.
     """
-    assert TelegramRateLimitGate.category_for(operation) == "dialog_sweep"
-    assert TelegramRateLimitGate.category_for("telegram_warm_dialog_cache") == "dialogs"
+    assert _category_for_operation(operation) == "dialog_sweep"
+    assert _category_for_operation("telegram_warm_dialog_cache") == "dialogs"
 
 
 def test_phase_two_categories_are_separately_calibrated() -> None:
@@ -118,8 +120,8 @@ def test_unknown_operation_warns_once_per_tag(caplog) -> None:
     hot path must not spam one line per call."""
     _WARNED_UNKNOWN_OPERATIONS.clear()
     with caplog.at_level(logging.WARNING, logger="telethon_floodgate.rate_limit_gate"):
-        assert TelegramRateLimitGate.category_for("telegram_send_poll") == "default"
-        assert TelegramRateLimitGate.category_for("telegram_send_poll") == "default"
+        assert _category_for_operation("telegram_send_poll") == "default"
+        assert _category_for_operation("telegram_send_poll") == "default"
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
     # The tag itself must be greppable from the message.
@@ -131,10 +133,73 @@ def test_registered_and_suffix_rescued_tags_never_warn(caplog) -> None:
     tags and decorated warm/sweep tags must stay silent."""
     _WARNED_UNKNOWN_OPERATIONS.clear()
     with caplog.at_level(logging.WARNING, logger="telethon_floodgate.rate_limit_gate"):
-        assert TelegramRateLimitGate.category_for("telegram_edit_admin") == "admin_action"
-        assert TelegramRateLimitGate.category_for("leave_channels:123_warm_dialog_cache") == "dialogs"
-        assert TelegramRateLimitGate.category_for("resume_stream_dialogs") == "dialog_sweep"
+        assert _category_for_operation("telegram_edit_admin") == "admin_action"
+        assert _category_for_operation("leave_channels:123_warm_dialog_cache") == "dialogs"
+        assert _category_for_operation("resume_stream_dialogs") == "dialog_sweep"
     assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+# --- strict_categories: fail closed on unregistered tags (#29) ---------------
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ("telegram_invoke_request", "telegram_fetch_me"),  # the 11.11.2026 incident tags
+)
+def test_strict_mode_raises_on_unregistered_tag_with_guidance(operation: str) -> None:
+    """Strict mode fails closed (#29): an unregistered tag raises a
+    configuration error instead of degrading into the unlimited-in-practice
+    default bucket that let the incident's retry storm run unthrottled."""
+    gate = TelegramRateLimitGate(strict_categories=True)
+    with pytest.raises(TelegramUnregisteredOperationError) as excinfo:
+        gate.category_for(operation)
+    message = str(excinfo.value)
+    assert operation in message  # the offending tag is named
+    assert "strict_categories" in message  # which knob is on
+    assert "admin_action" in message and "channel_lifecycle" in message  # registered categories
+    assert "telegram_send_message" in message  # registered tags are listed
+    assert "_OPERATION_CATEGORIES" in message  # where/how to register
+    # A configuration error is not a refusal: the shared "operation
+    # unavailable, move on" handler must not absorb it (hierarchy invariant).
+    assert not isinstance(excinfo.value, TelegramRateLimitedError)
+
+
+def test_strict_mode_keeps_registered_and_decorated_tags_working() -> None:
+    """The suffix rescue and exact registrations keep working under strict
+    mode — strict closes only the unknown-tag hole. resolve/reaction stay
+    registered no-op categories, and limiting mechanics are unchanged."""
+    clock = _Clock()
+    gate = TelegramRateLimitGate(strict_categories=True, time_func=clock, jitter_func=_no_jitter)
+    assert gate.category_for("telegram_send_message") == "send"
+    assert gate.category_for("leave_channels:123_warm_dialog_cache") == "dialogs"
+    assert gate.category_for("resume_stream_dialogs") == "dialog_sweep"
+    assert gate.category_for("telegram_resolve_entity") == "resolve"
+    assert gate.try_acquire("+1", "resolve") == 0.0
+    assert gate.try_acquire("+1", "dialogs") == 0.0
+    assert gate.try_acquire("+1", "dialogs") == 60.0
+
+
+def test_strict_mode_never_touches_the_try_acquire_contract() -> None:
+    """try_acquire receives an already-resolved category and keeps its
+    never-sleeps-never-raises contract; strict enforcement lives only in
+    category_for — even for a category literal the gate does not know."""
+    gate = TelegramRateLimitGate(strict_categories=True)
+    assert gate.try_acquire("+1", "default") == 0.0
+    assert gate.try_acquire("+1", "not_a_category") == 0.0
+
+
+def test_strict_categories_defaults_to_permissive_warn_once(caplog) -> None:
+    """Opt-in by constructor default: a plainly built gate keeps the #10
+    permissive behavior — unknown tag resolves to the default bucket with a
+    single warning, no exception."""
+    gate = TelegramRateLimitGate()
+    _WARNED_UNKNOWN_OPERATIONS.clear()
+    with caplog.at_level(logging.WARNING, logger="telethon_floodgate.rate_limit_gate"):
+        assert gate.category_for("telegram_send_poll") == "default"
+        assert gate.category_for("telegram_send_poll") == "default"
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "telegram_send_poll" in warnings[0].getMessage()
 
 
 def test_history_uses_empirical_window_with_conservative_margin() -> None:

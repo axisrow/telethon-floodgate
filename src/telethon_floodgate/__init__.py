@@ -51,6 +51,7 @@ from telethon_floodgate.rate_limit_gate import (
     TelegramPeerRateLimitedError,
     TelegramRateLimitedError,
     TelegramRateLimitGate,
+    TelegramUnregisteredOperationError,
 )
 from telethon_floodgate.rate_limiter import (
     GLOBAL_RESOLVE_BACKOFF_THRESHOLD_SEC,
@@ -61,7 +62,7 @@ from telethon_floodgate.rate_limiter import (
 )
 from telethon_floodgate.token_bucket import TokenBucket
 
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 
 __all__ = [
     "DEFAULT_COOLDOWN_SECONDS",
@@ -80,6 +81,7 @@ __all__ = [
     "TelegramPeerRateLimitedError",
     "TelegramRateLimitedError",
     "TelegramRateLimitGate",
+    "TelegramUnregisteredOperationError",
     "TokenBucket",
     "TRANSIENT_FLOOD_WAIT_MAX_SEC",
     "TRANSIENT_FLOOD_WAIT_RETRY_BUDGET_SEC",

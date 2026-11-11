@@ -49,6 +49,14 @@ gate = TelegramRateLimitGate(
 )
 ```
 
+An operation tag that is not registered resolves to the permissive `default`
+bucket with a warn-once log. Integrations that register their tags can fail
+closed instead: `TelegramRateLimitGate(strict_categories=True)` raises
+`TelegramUnregisteredOperationError` (a `ValueError`, deliberately not a
+refusal) from `category_for` for an unknown tag — naming the tag, the
+registered categories/tags and how to register it — while `try_acquire`
+keeps its never-raises contract (#29).
+
 `resolve` and `reaction` are intentionally no-op categories: in the origin
 project those paths have dedicated limiters (see `ResolveRateLimiter`, also
 shipped here).
