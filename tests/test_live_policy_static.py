@@ -131,6 +131,62 @@ def test_missing_env_failure_names_every_missing_variable():
         assert name in message
 
 
+# --- REAL_TG_PROXY: opt-in proxy for the live harness (issue #31) ----------
+
+
+def test_real_tg_proxy_unset_or_empty_means_direct_route():
+    proxy_from_env = _load_live_module("conftest")._proxy_from_env
+    assert proxy_from_env({}) is None
+    assert proxy_from_env({"REAL_TG_PROXY": ""}) is None
+    assert proxy_from_env({"REAL_TG_PROXY": "   "}) is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (
+            "socks5://u:p@proxy.example:1080",
+            {"proxy_type": "socks5", "addr": "proxy.example", "port": 1080, "username": "u", "password": "p"},
+        ),
+        (
+            "socks4://10.0.0.1:1080",
+            {"proxy_type": "socks4", "addr": "10.0.0.1", "port": 1080, "username": None, "password": None},
+        ),
+        (
+            "http://proxy.local:8080",
+            {"proxy_type": "http", "addr": "proxy.local", "port": 8080, "username": None, "password": None},
+        ),
+    ],
+)
+def test_real_tg_proxy_parses_supported_schemes(value, expected):
+    assert _load_live_module("conftest")._parse_proxy_url(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["ftp://h:1", "socks5://", "socks5://host", "socks5://host:notaport", "totally not a url"],
+)
+def test_real_tg_proxy_bad_value_fails_naming_the_variable(value):
+    with pytest.raises(ValueError, match="REAL_TG_PROXY") as exc_info:
+        _load_live_module("conftest")._proxy_from_env({"REAL_TG_PROXY": value})
+    # Same secret hygiene as the other REAL_TG_* variables: no echo of the value.
+    assert value not in str(exc_info.value)
+
+
+async def test_live_telegram_bad_proxy_fails_before_connecting(monkeypatch):
+    harness = _load_live_module("conftest")
+    constructor = Mock()
+    for name in policy.REQUIRED_ENV:
+        monkeypatch.setenv(name, "1")
+    monkeypatch.setenv("REAL_TG_PROXY", "ftp://nope.example:1")
+    monkeypatch.setattr(harness, "StringSession", Mock())
+    monkeypatch.setattr(harness, "TelegramClient", constructor)
+    with pytest.raises(pytest.fail.Exception, match="REAL_TG_PROXY"):
+        async with aclosing(harness.live_telegram.__wrapped__()) as fixture:
+            await anext(fixture)
+    constructor.assert_not_called()
+
+
 @pytest.mark.parametrize("flood_at", [None, 0, 2])
 async def test_live_send_pacing_and_flood_stop_offline(monkeypatch, flood_at):
     harness = _load_live_module("conftest")
@@ -166,6 +222,7 @@ async def test_live_send_pacing_and_flood_stop_offline(monkeypatch, flood_at):
     constructor = Mock(return_value=client)
     for name in policy.REQUIRED_ENV:
         monkeypatch.setenv(name, "1")
+    monkeypatch.delenv("REAL_TG_PROXY", raising=False)  # unset → the pre-#31 direct-route construction
     monkeypatch.setattr(harness, "StringSession", Mock())
     monkeypatch.setattr(harness, "TelegramClient", constructor)
     monkeypatch.setattr(send_test, "time", SimpleNamespace(monotonic=lambda: clock.now))
@@ -188,6 +245,7 @@ async def test_live_send_pacing_and_flood_stop_offline(monkeypatch, flood_at):
             await send_test.test_gate_paces_sends_to_one_per_second(sandbox)
 
     assert constructor.call_args.kwargs["flood_sleep_threshold"] == 0
+    assert "proxy" not in constructor.call_args.kwargs
     client.disconnect.assert_awaited_once()
     if flood_at is None:
         assert send_starts == pytest.approx([1000.0, 1001.1, 1002.2, 1003.3, 1004.4])

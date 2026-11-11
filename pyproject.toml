@@ -42,6 +42,13 @@ dev = [
     "build>=1.2",
     "twine>=6.0",
 ]
+# Opt-in live-test extra (tests_live/, never in CI): proxy support for
+# REAL_TG_PROXY. Telethon needs python-socks for SOCKS/HTTP proxies and only
+# warns (i.e. silently uses the direct route) when it is missing — the live
+# harness fails loudly on that instead (#31).
+live = [
+    "python-socks[asyncio]>=2,<4",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

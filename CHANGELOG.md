@@ -2,6 +2,26 @@
 
 ## 0.1.7 (unreleased)
 
+- Live harness (opt-in `tests_live/`) supports `REAL_TG_PROXY` (#31) —
+  `scheme://[user:pass@]host:port` with schemes `socks4`/`socks5`/`http`,
+  read by the `live_telegram` fixture and passed to `TelegramClient(proxy=…)`
+  as Telethon's dict form (string proxy types, resolved via python-socks).
+  Motivation: on a machine behind a TUN-mode VPN whose exit IP Telegram
+  graylists, the MTProto transport handshake is refused at the edge and no
+  live E2E could run at all — the proxy override steers the harness through
+  a working route. Contract:
+  - unset/empty → no proxy kwarg at all, the exact pre-#31 construction;
+  - a set-but-unparseable value (bad scheme/host/port) or python-socks
+    missing → loud `pytest.fail` naming `REAL_TG_PROXY`, never a silent
+    direct fallback — Telethon alone would only warn ("proxy argument will
+    be ignored") and quietly use the direct route, which is precisely the
+    failure mode the override exists to escape;
+  - the value is never echoed in error messages (same secret hygiene as the
+    other `REAL_TG_*` variables: env only).
+  - Dependency: new optional extra `telethon-floodgate[live]`
+    (`python-socks[asyncio]>=2,<4`), documented in the live-test docs, not
+    added to the base install. Library code (`src/telethon_floodgate/`)
+    stays socket-free — no proxy parameters on any gate/limiter class.
 - `TelegramRateLimitGate(strict_categories=True)` — opt-in fail-closed mode
   for unregistered operation tags (#29). An unknown tag at
   `gate.category_for(operation)` now raises the new

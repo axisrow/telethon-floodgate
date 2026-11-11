@@ -241,7 +241,12 @@ are a separate, explicit activity, in four levels:
   RUN_FLOODGATE_LIVE_TG=1 python -m pytest tests_live -x -v -s
   ```
   With the gate closed every test skips; with the gate open but the account
-  env missing they fail loudly naming the variables. `test_live_peer_keys`
+  env missing they fail loudly naming the variables. Behind a VPN/proxy
+  exit that Telegram refuses, set `REAL_TG_PROXY` to steer the harness
+  through a working route: `socks4|socks5|http://[user:pass@]host:port`
+  (opt-in extra `pip install 'telethon-floodgate[live]'`; unset/empty =
+  direct route as before; a bad value fails loudly naming the variable).
+  `test_live_peer_keys`
   (read-only) classifies every real `get_dialogs()` entity and fails on any
   UNKNOWN kind or malformed key; `test_live_send_gate` sends 5 messages to
   Saved Messages through the real gate and proves the 1.1s user-peer pacing
