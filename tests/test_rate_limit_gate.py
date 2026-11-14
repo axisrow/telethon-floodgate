@@ -99,7 +99,7 @@ def test_dialog_sweep_has_its_own_bucket(operation: str) -> None:
 @pytest.mark.parametrize(
     ("operation", "category"),
     (
-        ("telegram_fetch_me", "resolve"),
+        ("telegram_fetch_me", "history"),
         ("telegram_invoke_request", "history"),
     ),
 )
@@ -107,11 +107,14 @@ def test_transport_adapter_tags_are_registered(operation: str, category: str) ->
     """The tg-agent transport adapter's raw tags must not fall into the
     permissive ``default`` bucket (1000/min): a runaway loop over raw invokes
     was the fuel of the consumer's pool-wide flood (tg_content_factory#1805).
-    ``fetch_me`` is a profile read (resolve family); the raw invoke passthrough
-    shares the calibrated history quota class — its dominant use is reads, and
-    message collection never goes through it (stream_messages has its own
-    category)."""
+    Both share the calibrated history quota class — their dominant use is
+    reads. ``fetch_me`` was briefly mapped to "resolve" (0.1.8), but
+    "resolve" is not a default-configured bucket: consumers without it
+    silently priced the tag at default again (0.1.9 remap)."""
     assert _category_for_operation(operation) == category
+    # The category must be a real configured bucket, not a silent default.
+    gate = TelegramRateLimitGate()
+    assert category in gate.snapshot("+15551230001")["categories"]
 
 
 def test_phase_two_categories_are_separately_calibrated() -> None:

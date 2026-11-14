@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.9 (2026-11-14)
+
+- `telegram_fetch_me` remapped `resolve` → `history` (follow-up to 0.1.8,
+  tg_content_factory#1805): "resolve" is not a default-configured bucket
+  (opt-in via `category_limits`; resolve ops are separately guarded by the
+  consumer's `ResolveGuardMixin`), so consumers without it silently priced
+  the tag at `default` again. `history` (24/30s calibrated) is configured
+  everywhere. The registration test now also asserts the category is a
+  real configured bucket via `snapshot()`.
+
 ## 0.1.8 (2026-11-14)
 
 - Register the tg-agent transport adapter's raw tags in
