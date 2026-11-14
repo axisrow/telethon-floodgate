@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.8 (2026-11-14)
+
+- Register the tg-agent transport adapter's raw tags in
+  `_OPERATION_CATEGORIES` (tg_content_factory#1805): `telegram_fetch_me`
+  → `resolve`, `telegram_invoke_request` → `history`. Both previously fell
+  into the permissive `default` bucket (1000/min), where the sustained
+  budget never applied — the hole that let the 2026-11-11 retry storm run
+  unthrottled. Strict mode (#29) stays the safety net for any tag still
+  unregistered; strict-mode fixtures moved to a genuinely absent tag.
+
 ## 0.1.7 (2026-11-11)
 
 - Live harness (opt-in `tests_live/`) supports `REAL_TG_PROXY` (#31) —
