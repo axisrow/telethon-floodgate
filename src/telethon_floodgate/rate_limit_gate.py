@@ -116,6 +116,14 @@ _OPERATION_CATEGORIES = {
     "telegram_import_chat_invite": "channel_lifecycle",
     "telegram_delete_channel": "channel_lifecycle",
     "telegram_delete_chat": "channel_lifecycle",
+    # The tg-agent transport adapter's raw passthroughs (tg_content_factory
+    # #1805): an unregistered raw invoke looped inside the permissive default
+    # bucket (1000/min) and fueled a pool-wide flood. fetch_me is a profile
+    # read (resolve family); the raw invoke shares the calibrated history
+    # quota class — its dominant use is reads, and message collection never
+    # goes through it (stream_messages has its own category).
+    "telegram_fetch_me": "resolve",
+    "telegram_invoke_request": "history",
 }
 
 

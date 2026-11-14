@@ -96,6 +96,24 @@ def test_dialog_sweep_has_its_own_bucket(operation: str) -> None:
     assert _category_for_operation("telegram_warm_dialog_cache") == "dialogs"
 
 
+@pytest.mark.parametrize(
+    ("operation", "category"),
+    (
+        ("telegram_fetch_me", "resolve"),
+        ("telegram_invoke_request", "history"),
+    ),
+)
+def test_transport_adapter_tags_are_registered(operation: str, category: str) -> None:
+    """The tg-agent transport adapter's raw tags must not fall into the
+    permissive ``default`` bucket (1000/min): a runaway loop over raw invokes
+    was the fuel of the consumer's pool-wide flood (tg_content_factory#1805).
+    ``fetch_me`` is a profile read (resolve family); the raw invoke passthrough
+    shares the calibrated history quota class — its dominant use is reads, and
+    message collection never goes through it (stream_messages has its own
+    category)."""
+    assert _category_for_operation(operation) == category
+
+
 def test_phase_two_categories_are_separately_calibrated() -> None:
     gate = TelegramRateLimitGate()
     assert gate.category_for("telegram_stream_messages") == "history"
@@ -144,7 +162,13 @@ def test_registered_and_suffix_rescued_tags_never_warn(caplog) -> None:
 
 @pytest.mark.parametrize(
     "operation",
-    ("telegram_invoke_request", "telegram_fetch_me"),  # the 11.11.2026 incident tags
+    (
+        # a tag genuinely absent from _OPERATION_CATEGORIES; the 11.11.2026
+        # incident tags (telegram_invoke_request/telegram_fetch_me) are
+        # REGISTERED now (#30) — covered by
+        # test_transport_adapter_tags_are_registered above:
+        "telegram_unknown_raw_call",
+    ),
 )
 def test_strict_mode_raises_on_unregistered_tag_with_guidance(operation: str) -> None:
     """Strict mode fails closed (#29): an unregistered tag raises a
