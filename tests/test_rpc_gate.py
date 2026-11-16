@@ -9,6 +9,7 @@ themselves would prove nothing about nested-RPC coverage.
 
 import asyncio
 import datetime
+import inspect
 
 import pytest
 from telethon import TelegramClient, errors, functions, types, utils
@@ -16,6 +17,8 @@ from telethon.sessions import MemorySession
 
 from telethon_floodgate import (
     RateLimitSpec,
+    ResolveRateLimiter,
+    RpcDispatchBudget,
     TelegramRateLimitedError,
     TelegramRateLimitGate,
     TelegramRpcDeferredError,
@@ -300,15 +303,15 @@ async def test_upload_parts_do_not_consume_send_quota():
 
 async def test_unknown_rpc_lands_in_default():
     client, recorder = make_client()
-    recorder.respond(functions.users.GetUsersRequest, [canned_user()])
+    recorder.respond(functions.help.GetNearestDcRequest, True)
     gate = TelegramRateLimitGate()
     decisions: list = []
     handle = attach_rpc_gate(client, gate, PHONE, on_decision=decisions.append)
 
-    await client.get_me()
+    await client(functions.help.GetNearestDcRequest())
 
-    assert decisions[0].rpc == "GetUsersRequest"
-    assert decisions[0].operation == "rpc:GetUsersRequest"
+    assert decisions[0].rpc == "GetNearestDcRequest"
+    assert decisions[0].operation == "rpc:GetNearestDcRequest"
     assert decisions[0].category == "default"
     handle.detach()
 
@@ -320,7 +323,7 @@ async def test_strict_categories_fail_closed_on_unknown_rpc():
     handle = attach_rpc_gate(client, gate, PHONE)
 
     with pytest.raises(TelegramUnregisteredOperationError):
-        await client.get_me()
+        await client(functions.help.GetNearestDcRequest())
 
     assert recorder.dispatches == []
     handle.detach()
@@ -449,3 +452,170 @@ async def test_attach_detach_lifecycle():
     await client.send_message("newuser", "hi")
     assert len(decisions) == 2  # one resolve + one send, no doubling
     handle2.detach()
+
+
+async def test_no_updates_wrapper_cannot_bypass_exhausted_send_budget():
+    client, recorder = make_client()
+    client._no_updates = True
+    install_defaults(recorder)
+    recorder.respond(
+        functions.InvokeWithoutUpdatesRequest,
+        types.UpdateShortSentMessage(
+            id=5, pts=0, pts_count=0,
+            date=datetime.datetime.now(datetime.timezone.utc), out=True,
+        ),
+    )
+    gate = TelegramRateLimitGate(category_limits={"send": RateLimitSpec(1, 60)})
+    assert gate.try_acquire(PHONE, "send") == 0
+    attach_rpc_gate(client, gate, PHONE)
+    with pytest.raises(TelegramRpcDeferredError):
+        await client.send_message(types.InputPeerUser(7, 42), "must stay unsent")
+    assert recorder.dispatches == []
+
+
+async def test_admission_refusal_does_not_spend_send_budget():
+    client, recorder = make_client()
+    install_defaults(recorder)
+    gate = TelegramRateLimitGate(category_limits={"send": RateLimitSpec(1, 60)})
+    attach_rpc_gate(client, gate, PHONE, admissions=[lambda admission: 12.0])
+    with pytest.raises(TelegramRpcDeferredError):
+        await client.send_message(types.InputPeerUser(7, 42), "must stay unsent")
+    assert recorder.dispatches == []
+    assert gate.snapshot(PHONE)["categories"]["send"]["used"] == 0
+
+
+async def test_batch_refusal_does_not_spend_any_member_budget():
+    client, recorder = make_client()
+    recorder.respond(
+        functions.messages.DeleteMessagesRequest,
+        types.messages.AffectedMessages(pts=0, pts_count=0),
+    )
+    gate = TelegramRateLimitGate(category_limits={"send": RateLimitSpec(2, 60)})
+    attach_rpc_gate(client, gate, PHONE)
+    with pytest.raises(TelegramRpcDeferredError):
+        await client([functions.messages.DeleteMessagesRequest([i]) for i in range(3)])
+    assert recorder.dispatches == []
+    assert gate.snapshot(PHONE)["categories"]["send"]["used"] == 0
+
+
+async def test_history_category_exemption_still_runs_common_admission():
+    client, recorder = make_client()
+    recorder.respond(
+        functions.messages.GetHistoryRequest,
+        types.messages.Messages(messages=[], chats=[], users=[],
+                                **({"topics": []} if "topics" in inspect.signature(types.messages.Messages).parameters
+                                   else {})),
+    )
+    gate = TelegramRateLimitGate()
+    seen = []
+
+    def exhausted(admission):
+        seen.append(admission.rpc)
+        return 12.0
+
+    attach_rpc_gate(client, gate, PHONE, admissions=[exhausted])
+    with pytest.raises(TelegramRpcDeferredError):
+        await client.get_messages(types.InputPeerUser(7, 42), limit=1)
+    assert seen == ["GetHistoryRequest"]
+    assert recorder.dispatches == []
+
+
+async def test_composed_mutable_budget_refusal_leaves_every_budget_untouched():
+    client, recorder = make_client()
+    install_defaults(recorder)
+    gate = lifted_peer_gate()
+    limiter = ResolveRateLimiter(max_calls=1, window_sec=60, sustained_max_calls=None,
+                                sustained_window_sec=None, jitter_sec=0)
+    budget = RpcDispatchBudget(
+        lambda members: limiter.peek_many(PHONE, len(members)),
+        lambda members: limiter.record_many(PHONE, len(members)),
+    )
+    refuse = RpcDispatchBudget(lambda members: 30, lambda members: pytest.fail("must not commit"))
+    attach_rpc_gate(client, gate, PHONE, budgets=[budget, refuse])
+    with pytest.raises(TelegramRpcDeferredError):
+        await client.send_message(types.InputPeerUser(7, 42), "unsent")
+    assert limiter.used(PHONE) == 0
+    assert gate.snapshot(PHONE)["categories"]["send"]["used"] == 0
+    assert recorder.dispatches == []
+
+
+async def test_batch_aggregates_peer_cost_without_partial_send():
+    client, recorder = make_client()
+    install_defaults(recorder)
+    gate = TelegramRateLimitGate()
+    attach_rpc_gate(client, gate, PHONE)
+    with pytest.raises(TelegramRpcDeferredError):
+        await client([functions.messages.SendMessageRequest(types.InputPeerUser(7, 42), str(i)) for i in range(2)])
+    assert recorder.dispatches == []
+    assert gate.snapshot(PHONE)["categories"]["send"]["used"] == 0
+
+
+async def test_waiting_budget_rechecks_other_budgets_before_dispatch():
+    client, recorder = make_client()
+    install_defaults(recorder)
+    gate = TelegramRateLimitGate(category_limits={"send": RateLimitSpec(1, 60)})
+    waiting = True
+    commits = []
+
+    async def sleep(seconds):
+        nonlocal waiting
+        assert seconds == 5
+        waiting = False
+        assert gate.try_acquire(PHONE, "send") == 0  # concurrent consumer wins
+
+    budget = RpcDispatchBudget(lambda members: 5 if waiting else 0,
+                               lambda members: commits.append(len(members)), mode="wait")
+    attach_rpc_gate(client, gate, PHONE, budgets=[budget], sleep=sleep)
+    with pytest.raises(TelegramRpcDeferredError):
+        await client.send_message(types.InputPeerUser(7, 42), "unsent")
+    assert commits == []
+    assert recorder.dispatches == []
+
+
+async def test_waiting_batch_preserves_shape_order_and_cancel_before_dispatch():
+    client, recorder = make_client()
+    install_defaults(recorder)
+    gate = lifted_peer_gate()
+    sleeping = asyncio.Event()
+
+    async def sleep(seconds):
+        sleeping.set()
+        await asyncio.Future()
+
+    budget = RpcDispatchBudget(lambda members: 5, lambda members: pytest.fail("cancelled"), mode="wait")
+    handle = attach_rpc_gate(client, gate, PHONE, budgets=[budget], sleep=sleep)
+    requests = [functions.messages.SendMessageRequest(types.InputPeerUser(7, 42), str(i)) for i in range(2)]
+    futures = client._sender.send(requests, ordered=True)
+    assert isinstance(futures, list) and len(futures) == 2
+    await sleeping.wait()
+    futures[0].cancel()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert all(f.cancelled() for f in futures)
+    assert recorder.dispatches == []
+    assert gate.snapshot(PHONE)["categories"]["send"]["used"] == 0
+    handle.detach()
+
+
+async def test_impossible_wait_batch_refuses_without_sleep():
+    client, recorder = make_client()
+    install_defaults(recorder)
+    budget = RpcDispatchBudget(lambda members: 30, lambda members: pytest.fail("must not commit"),
+                               mode="wait", max_batch_size=1)
+    attach_rpc_gate(client, lifted_peer_gate(), PHONE, budgets=[budget])
+    with pytest.raises(TelegramRpcDeferredError):
+        await client([functions.messages.SendMessageRequest(types.InputPeerUser(7, 42), str(i)) for i in range(2)])
+    assert recorder.dispatches == []
+
+
+async def test_flood_rpc_metadata_available_to_caller_before_observer_finishes():
+    client, recorder = make_client()
+    install_defaults(recorder)
+    recorder.flood_then(functions.contacts.ResolveUsernameRequest, errors.FloodWaitError(None, capture=3600))
+    attach_rpc_gate(client, lifted_peer_gate(), PHONE)
+    with pytest.raises(errors.FloodWaitError) as caught:
+        await client.send_message("newuser", "hi")
+    assert caught.value.rpc == "ResolveUsernameRequest"
+    assert caught.value.rpc_read_only is True
+    assert caught.value.source == "telegram"
+    assert len(recorder.dispatches) == 1

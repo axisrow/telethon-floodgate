@@ -41,6 +41,9 @@ class FloodWaitInfo(BaseModel):
     wait_seconds: int
     next_available_at_utc: datetime
     detail: str
+    rpc: str | None = None
+    source: str | None = None
+    delivery_state: str | None = None
 
 
 class HandledFloodWaitError(RuntimeError):
@@ -163,6 +166,8 @@ async def handle_flood_wait(
         wait_seconds=wait_seconds,
         next_available_at_utc=next_available_at_utc,
         detail=detail,
+        rpc=getattr(exc, "rpc", None),
+        source=getattr(exc, "source", None),
     )
 
 

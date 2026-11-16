@@ -188,63 +188,65 @@ handled FLOOD_WAIT also feeds the gate's optional adaptive backoff — no
 manual wiring needed. Don't ALSO call `note_flood` from a `report_flood`
 hook when passing `gate=`: that double-counts.
 
-## RPC dispatch boundary — every RPC through the gate (opt-in, #34)
+## RPC dispatch boundary (opt-in)
 
-Public-call gating cannot see the RPCs Telethon makes behind a consumer's
-back: cold-cache entity resolution inside `send_message`, mention-link
-fan-out, paginated writes (`delete_messages` chunks), upload parts,
-downloads and big-file traffic on exported/CDN senders, retries inside
-Telethon's `_call` loop, and calls from native objects (`Message.reply`) or
-event-builder resolution. `attach_rpc_gate` wraps the one seam all of them
-share — each sender's `send` — so every actual dispatch attempt is charged
-against your existing gate before anything is sent:
+Attach to a client **before connecting**. Every application request sent by its
+main, borrowed or CDN sender is checked, including nested entity resolution,
+native Message/conversation/event traffic, transfers, batches and retries.
+Transparent query wrappers are classified by their inner request, including
+when `receive_updates=False`. Unknown RPCs use the bounded default category;
+strict categories reject unknown registrations.
 
 ```python
-from telethon_floodgate import attach_rpc_gate
+from telethon_floodgate import RpcDispatchBudget, attach_rpc_gate
 
-handle = attach_rpc_gate(
-    client, gate, phone,
-    admissions=[username_limiter.allow],   # your own budgets, e.g. resolves
-    on_decision=metrics.observe,           # structured per-attempt metadata
-    on_flood=lambda sec, rpc: log.info("flood %ss on %s", sec, rpc),
+username_budget = RpcDispatchBudget(
+    peek_batch=lambda calls: username_limiter.peek_many(phone, len(calls)),
+    commit_batch=lambda calls: username_limiter.record_many(phone, len(calls)),
+    name="resolve_username",
+    applies=lambda call: call.rpc == "ResolveUsernameRequest",
 )
-...
-handle.detach()                            # restores the original send callables
+handle = attach_rpc_gate(client, gate, phone, budgets=[username_budget])
+# ... use the client, reconnect without resetting shared budgets ...
+handle.detach()
 ```
 
-Lifecycle: attach once after creating the client (reconnections keep the
-same sender, so budgets never reset and nothing stacks); attach twice
-raises; `detach` restores exactly what was there before, including
-consumer-installed transport recorders. All telethon versions with
-`MTProtoSender.send` returning futures (1.x, tested against 1.45) are
-supported.
+Share the underlying gate and consumer limiter objects between clients of the
+same account. A batch is preflighted as a whole, with repeated category/peer
+costs aggregated. All checks pass before any budget commits or request is sent.
+Budget callbacks are event-loop affine: `peek_batch` must not spend;
+`commit_batch` must not refuse, raise, or await. Legacy `admissions` callbacks
+remain validation predicates; migrate stateful hooks to `budgets` so multiple
+checks compose without phantom charges.
 
-Accounting policy — classified by the actual RPC, not the outer tag:
+Consumer budgets see category-exempt reads too. `None` in `RpcDispatchPolicy`
+means no category charge, not an exemption from consumer checks. Only known
+protocol leaf requests (keepalives, connection configuration and authorization
+transfer) bypass application budgets. Message page defaults leave logical
+history accounting to the consumer/`wrap_messages_iterator`; dialogs pages
+have their existing separate page bucket. Transfers use default, not send.
 
-| RPC family | Operation tag | Category |
-| --- | --- | --- |
-| `SendMessage` / `SendMedia` / `SendMultiMedia` / `EditMessage` / `ForwardMessages` | `rpc_send` | `send` (+ per-peer bucket) |
-| `ResolveUsername` | `rpc_resolve` | `resolve` (no-op; enforce with an `admissions` hook) |
-| upload parts / `GetFile` / CDN file | `rpc_upload` / `rpc_download` | `default` (deliberately not send/history quota) |
-| history/search/read pages | exempt | — (`wrap_messages_iterator` owns that budget; re-pricing pages here would silently halve it) |
-| anything else | `rpc:<Name>` (warn-once) | `default`; with `strict_categories=True` it fails closed instead |
+Budgets default to `mode="defer"`. A process ceiling may opt into `mode="wait"`:
+the guard returns proxy Futures, waits without blocking the event loop, then
+rechecks every budget. Set `max_batch_size` for a finite-capacity wait budget;
+an impossible batch is refused rather than waiting forever. Optional `prepare`
+refreshes external state before admission. Cancelling any unsent batch member
+cancels the unsent batch. After sender invocation, cancellation follows native
+Future semantics and does not prove the write was undelivered.
 
-A refusal raises `TelegramRpcDeferredError` (a `TelegramRateLimitedError`
-subclass) and nothing is dispatched — the boundary never sleeps; waiting is
-the caller's job (`gate.acquire`). One dispatch is charged once to each
-applicable budget; batch members and genuine retry attempts are charged
-individually. Flood waits surfacing through the boundary reach `on_flood`;
-`flood_feedback=True` additionally feeds `gate.note_flood` — enable it only
-if no call site also reports the same flood via `handle_flood_wait(...,
-gate=...)`, or backoff double-counts.
+`on_decision` receives curated admission/dispatch facts; `on_result` receives
+an admission and its exception (or `None`). Flood exceptions carry `rpc`,
+`rpc_category`, `rpc_read_only`, `source` and `rpc_dispatched` before callers
+observe them, including already-completed Futures. `on_flood(seconds, rpc)`
+remains supported. Choose exactly one flood-feedback owner; enabling both
+`flood_feedback=True` and consumer `handle_flood_wait(..., gate=...)` would
+report the same flood twice. The guard never automatically replays a write.
 
-Limitations: multi-member batches admit members sequentially, so a
-mid-batch refusal may leave earlier members' slots consumed (undispatched —
-conservative direction). Multi-hop CDN re-upload chains beyond the first hop
-and connection-level resends after a reconnect are not separately charged.
-`on_flood`/`flood_feedback` may still fire for responses still in flight
-when `detach` happens: detaching gates future dispatches, not requests
-already sent.
+Repeated attach raises; detach restores the original sender callables and
+cancels pending admission waits. Reattach with the same budget objects.
+Supported Telethon 1.x dispatch Futures are exercised offline at the sender
+boundary; transport-level MTProto retransmission/ACK machinery is not counted
+as a new application RPC admission.
 
 ## Design notes
 

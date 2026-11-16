@@ -12,7 +12,7 @@ import asyncio
 import logging
 import time
 from collections import OrderedDict, defaultdict, deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from math import isfinite
 from typing import Any
@@ -133,6 +133,11 @@ _OPERATION_CATEGORIES = {
     # calibrated send/history quotas; consumers with real transfer volume
     # should register a dedicated category via category_limits.
     "rpc_send": "send",
+    "rpc_dialogs_page": "dialogs_page",
+    "rpc_default": "default",
+    "rpc_reaction": "reaction",
+    "rpc_channel_lifecycle": "channel_lifecycle",
+    "rpc_admin_action": "admin_action",
     "rpc_resolve": "resolve",
     "rpc_upload": "default",
     "rpc_download": "default",
@@ -501,6 +506,35 @@ class TelegramRateLimitGate:
             peer_limiter.record_many(phone, slots)
         limiter.record_many(phone, slots)
         return 0.0
+
+    def _batch_buckets(
+        self, phone: str, requests: Sequence[tuple[str, str | None]]
+    ) -> list[tuple[ResolveRateLimiter, int]]:
+        buckets: dict[int, tuple[ResolveRateLimiter, int]] = {}
+        for category, peer in requests:
+            if category in {"resolve", "reaction"}:
+                continue
+            limiters = [self._limiters.get(category, self._limiters["default"])]
+            if peer is not None:
+                peer_limiter = self._peer_bucket(phone, category, peer)
+                if peer_limiter is not None:
+                    limiters.append(peer_limiter)
+            for limiter in limiters:
+                previous = buckets.get(id(limiter))
+                buckets[id(limiter)] = (limiter, 1 + (previous[1] if previous else 0))
+        return list(buckets.values())
+
+    def peek_batch(self, phone: str, requests: Sequence[tuple[str, str | None]]) -> float:
+        """Check aggregate category/peer cost without spending; do not yield before commit."""
+        return max(
+            (limiter.peek_many(phone, slots) for limiter, slots in self._batch_buckets(phone, requests)),
+            default=0.0,
+        ) * self._flood_multiplier(phone)
+
+    def commit_batch(self, phone: str, requests: Sequence[tuple[str, str | None]]) -> None:
+        """Commit a peek-admitted batch; synchronous, without a second admission."""
+        for limiter, slots in self._batch_buckets(phone, requests):
+            limiter.record_many(phone, slots)
 
     async def acquire(
         self,

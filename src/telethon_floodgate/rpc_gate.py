@@ -1,43 +1,17 @@
-"""RPC dispatch-boundary enforcement for an existing TelegramClient (#34).
+"""Telethon dispatch admission, including nested RPCs and native objects.
 
-Public calls like ``send_message`` make additional RPCs behind the consumer's
-back: cold-cache entity resolution (``ResolveUsername``), paginated writes
-(``delete_messages`` -> N chunk requests), upload parts, retries inside
-Telethon's ``_call`` loop, and calls from native objects
-(``Message.reply``) or event-builder resolution. None of those pass the
-consumer's own limiter, so no amount of limiter arithmetic on public calls
-can prevent the traffic.
-
-The mechanism here is the library-side fix: it wraps the one Telethon seam
-every outgoing RPC goes through — ``MTProtoSender.send`` on each sender the
-client dispatches on (the main sender, exported senders handed out by
-``_borrow_exported_sender`` for downloads, and CDN senders) — and charges
-each actual dispatch attempt against a shared :class:`TelegramRateLimitGate`
-plus consumer-supplied admission hooks (e.g. the username budget).
-
-Opt-in per client via :func:`attach_rpc_gate`; detaching restores the exact
-original send callables. Refusals raise :class:`TelegramRpcDeferredError`, a
-``TelegramRateLimitedError`` subclass, so every existing "operation
-unavailable, move on" handler absorbs them unchanged. The boundary never
-sleeps: deferral is the caller's decision (``TelegramRateLimitGate.acquire``
-remains the documented way to wait), because sleeping inside Telethon's
-dispatch would hold library-internal machinery hostage.
-
-Defaults are deliberately narrow: only the send family, username resolves
-and file transfer RPCs are priced (transfer reads/writes land in the
-permissive ``default`` bucket, not in calibrated send/history quotas);
-message-fetch pages stay exempt because ``wrap_messages_iterator`` already
-owns the history budget — double-charging would silently halve it. Unknown
-RPCs fall through to the warn-once ``default`` category (#10) and, under
-``strict_categories=True`` (#29), fail closed with
-``TelegramUnregisteredOperationError`` instead of becoming a silent bypass.
+Attach before connecting. The default path is synchronous. Optional wait
+budgets preserve MTProtoSender.send's Future/list[Future] return contract.
+Final checks, commits and sender invocation never yield to another caller.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from math import isfinite
+from typing import Any, Literal
 
 from telethon import errors, utils
 from telethon.tl import functions as tl_functions
@@ -47,43 +21,35 @@ from telethon_floodgate.peer import peer_key
 from telethon_floodgate.rate_limit_gate import TelegramRateLimitGate
 
 logger = logging.getLogger(__name__)
-
-# Instance markers: the handle records itself on the client so a second
-# attach fails loudly instead of stacking wrappers (#34 lifecycle), and the
-# pristine send callable is parked on the sender so detach restores exactly
-# what was there before — including a consumer-installed transport recorder.
 _DISPATCH_ATTR = "_telethon_floodgate_dispatch"
 _ORIGINAL_SEND_ATTR = "_telethon_floodgate_original_send"
-
-# Flood families Telethon's _call itself special-cases: everything here is a
-# real pacing signal from Telegram, worth exposing even above the consumer's
-# own flood handling.
 _FLOOD_ERRORS = (
-    errors.FloodWaitError,
-    errors.FloodPremiumWaitError,
-    errors.SlowModeWaitError,
-    errors.FloodTestPhoneWaitError,
+    errors.FloodWaitError, getattr(errors, "FloodPremiumWaitError", errors.FloodWaitError),
+    errors.SlowModeWaitError, errors.FloodTestPhoneWaitError,
 )
-
-# RPC classes priced out of the box, keyed by the actual TL class — the
-# dispatch boundary classifies by the real RPC, not the outer operation tag
-# (#34: "classify by the actual RPC rather than only the outer operation
-# tag"). ``None`` means explicitly exempt: no charge, no warn-once noise.
-#
-# Tags reuse the calibrated categories; categories are backward compatible:
-#   rpc_send -> send, rpc_resolve -> resolve (no-op category; the username
-#   budget is a consumer admission hook), rpc_upload/rpc_download -> default.
-# Transfers must NOT eat send/resolve/history quotas (#34), and read pages
-# stay exempt because wrap_messages_iterator owns the history budget —
-# re-pricing pages against the logical-history quota here would silently
-# halve it ("do not silently reinterpret calibrated logical-history quotas
-# as per-page quotas", #34).
+_QUERY_WRAPPERS = frozenset({
+    "InvokeWithLayerRequest", "InvokeWithoutUpdatesRequest", "InitConnectionRequest",
+    "InvokeAfterMsgRequest", "InvokeAfterMsgsRequest", "InvokeWithTakeoutRequest",
+    "InvokeWithBusinessConnectionRequest", "InvokeWithGooglePlayIntegrityRequest",
+    "InvokeWithApnsSecretRequest", "InvokeWithMessagesRangeRequest",
+})
+_INFRASTRUCTURE = frozenset({
+    tl_functions.PingRequest, tl_functions.PingDelayDisconnectRequest,
+    tl_functions.help.GetConfigRequest, tl_functions.help.GetCdnConfigRequest,
+    tl_functions.auth.ExportAuthorizationRequest, tl_functions.auth.ImportAuthorizationRequest,
+})
+# None exempts a category charge, NOT common consumer budgets. Protocol
+# infrastructure is a separate, narrow leaf-constructor exemption.
 DEFAULT_RPC_OPERATIONS: dict[object, str | None] = {
     tl_functions.messages.SendMessageRequest: "rpc_send",
     tl_functions.messages.SendMediaRequest: "rpc_send",
     tl_functions.messages.SendMultiMediaRequest: "rpc_send",
     tl_functions.messages.EditMessageRequest: "rpc_send",
     tl_functions.messages.ForwardMessagesRequest: "rpc_send",
+    tl_functions.messages.DeleteMessagesRequest: "rpc_send",
+    tl_functions.channels.DeleteMessagesRequest: "rpc_send",
+    tl_functions.messages.DeleteScheduledMessagesRequest: "rpc_send",
+    tl_functions.messages.UpdatePinnedMessageRequest: "rpc_send",
     tl_functions.contacts.ResolveUsernameRequest: "rpc_resolve",
     tl_functions.upload.SaveFilePartRequest: "rpc_upload",
     tl_functions.upload.SaveBigFilePartRequest: "rpc_upload",
@@ -96,57 +62,62 @@ DEFAULT_RPC_OPERATIONS: dict[object, str | None] = {
     tl_functions.messages.GetScheduledHistoryRequest: None,
     tl_functions.messages.GetMessagesRequest: None,
     tl_functions.channels.GetMessagesRequest: None,
-    # Library infrastructure, not application traffic: the sender dispatches
-    # PingRequest itself every ~60s (mtprotosender._keepalive_ping) and every
-    # connect — including each automatic reconnection — sends the
-    # InvokeWithLayer(init) handshake (telegrambaseclient.connect). Charging
-    # them would count the library staying alive against a quota; refusing
-    # them under strict_categories would kill the keepalive task (it catches
-    # only ConnectionError/CancelledError) and break reconnection outright.
-    tl_functions.PingRequest: None,
-    tl_functions.InvokeWithLayerRequest: None,
-    tl_functions.InvokeWithoutUpdatesRequest: None,
+    tl_functions.messages.GetDialogsRequest: "rpc_dialogs_page",
 }
+# Names keep optional constructors compatible with older supported Telethon.
+DEFAULT_RPC_OPERATIONS.update({
+    "CreateChannelRequest": "rpc_channel_lifecycle", "CreateChatRequest": "rpc_channel_lifecycle",
+    "DeleteChannelRequest": "telegram_delete_channel", "DeleteChatUserRequest": "telegram_delete_chat",
+    "LeaveChannelRequest": "telegram_delete_channel", "JoinChannelRequest": "telegram_join_channel",
+    "ImportChatInviteRequest": "telegram_join_channel", "EditAdminRequest": "rpc_admin_action",
+    "EditBannedRequest": "rpc_admin_action", "InviteToChannelRequest": "rpc_admin_action",
+    "GetMessageReactionsListRequest": "default", "GetParticipantsRequest": "default",
+    "GetUserPhotosRequest": "default", "GetAdminLogRequest": "default",
+    "GetUsersRequest": "default", "GetChannelsRequest": "default", "GetChatsRequest": "default",
+    "ReadHistoryRequest": "default", "ReadDiscussionRequest": "default",
+    "ReadMentionsRequest": "default", "ReadReactionsRequest": "default", "SendReactionRequest": "reaction",
+    "GetStateRequest": "default", "GetDifferenceRequest": "default", "GetChannelDifferenceRequest": "default",
+    "EditChatAdminRequest": "rpc_admin_action", "EditChatDefaultBannedRightsRequest": "rpc_admin_action",
+    "EditPeerFoldersRequest": "rpc_admin_action", "UpdateUsernameRequest": "telegram_update_channel_username",
+    "SendScheduledMessagesRequest": "rpc_send", "DeleteHistoryRequest": "rpc_channel_lifecycle",
+})
+DEFAULT_RPC_OPERATIONS.update({key: "rpc_default" for key, value in DEFAULT_RPC_OPERATIONS.items()
+                               if value == "default"})
+DEFAULT_RPC_OPERATIONS["SendReactionRequest"] = "rpc_reaction"
+_READ_ONLY_NAMES = frozenset({
+    "ResolveUsernameRequest", "ResolvePhoneRequest", "CheckChatInviteRequest",
+    "GetHistoryRequest", "SearchRequest", "SearchGlobalRequest", "GetRepliesRequest",
+    "GetScheduledHistoryRequest", "GetMessagesRequest", "GetDialogsRequest",
+    "GetParticipantsRequest", "GetUserPhotosRequest", "GetAdminLogRequest",
+    "GetUsersRequest", "GetChannelsRequest", "GetChatsRequest", "GetMessageReactionsListRequest",
+    "GetFullChannelRequest", "GetFullChatRequest", "GetFullUserRequest",
+    "GetForumTopicsRequest", "GetForumTopicsByIDRequest", "GetFileRequest", "GetCdnFileRequest",
+    "GetCdnFileHashesRequest", "GetFileHashesRequest", "GetStateRequest", "GetDifferenceRequest",
+    "GetChannelDifferenceRequest", "GetAllDraftsRequest", "GetSavedGifsRequest", "GetInlineBotResultsRequest",
+})
 
 
-class TelegramRpcDeferredError(TelegramRateLimitedError):
-    """Raised at the RPC dispatch boundary when a budget defers the RPC.
-
-    Subclass of ``TelegramRateLimitedError`` per the project invariant: one
-    "operation unavailable, move on" handler covers the proactive gate,
-    per-peer buckets, the breaker, the username limiter and now every nested,
-    event-driven or native-object RPC the boundary intercepts. The RPC was
-    NOT dispatched; ``retry_after_sec`` is the defer the budgets returned.
-    """
-
-    def __init__(self, phone: str, operation: str, retry_after_sec: float, rpc: str) -> None:
-        message = (
-            f"rpc {rpc} deferred by {operation} budget for {phone}; "
-            f"not dispatched, retry in {retry_after_sec:.1f}s"
-        )
-        super().__init__(phone, operation, retry_after_sec, message=message)
-        self.rpc = rpc
+def _leaf(request: Any) -> Any:
+    seen: set[int] = set()
+    while type(request).__name__ in _QUERY_WRAPPERS and id(request) not in seen:
+        seen.add(id(request))
+        request = request.query
+    return request
 
 
 @dataclass(frozen=True)
 class RpcDispatchAdmission:
-    """What is about to be dispatched; input for consumer admission hooks."""
-
     phone: str
     rpc: str
     operation: str
-    category: str
+    category: str | None
     peer: str | None
+    read_only: bool = False
+    infrastructure: bool = False
 
 
 @dataclass(frozen=True)
 class RpcDispatchDecision:
-    """Structured outcome of one admission, per dispatched member/attempt.
-
-    Emitted for every admission (admitted or refused, including exempt RPCs)
-    so a consumer can correlate boundary traffic with its outer operation.
-    """
-
     phone: str
     rpc: str
     operation: str | None
@@ -154,95 +125,104 @@ class RpcDispatchDecision:
     peer: str | None
     admitted: bool
     defer_sec: float
+    dispatched: bool = False
+    read_only: bool = False
+
+
+@dataclass(frozen=True)
+class RpcDispatchBudget:
+    """A two-phase budget over a complete application-RPC batch.
+
+    peek_batch returns a nonnegative delay without spending. commit_batch
+    cannot refuse or yield. Share state across clients. wait budgets enable
+    asynchronous pacing; defer budgets refuse. max_batch_size prevents an
+    impossible wait. prepare optionally refreshes external state before checks.
+    Legacy admissions are validation callbacks; use this API for mutable state.
+    """
+    peek_batch: Callable[[Sequence[RpcDispatchAdmission]], float]
+    commit_batch: Callable[[Sequence[RpcDispatchAdmission]], None]
+    name: str = "consumer"
+    mode: Literal["defer", "wait"] = "defer"
+    max_batch_size: int | None = None
+    prepare: Callable[[Sequence[RpcDispatchAdmission]], Awaitable[None]] | None = None
+    applies: Callable[[RpcDispatchAdmission], bool] = lambda admission: True
+
+
+class TelegramRpcDeferredError(TelegramRateLimitedError):
+    """A local refusal: the whole dispatch batch is still unsent."""
+
+    def __init__(self, phone: str, operation: str, retry_after_sec: float, rpc: str, *,
+                 category: str | None = None, budget: str = "gate") -> None:
+        super().__init__(phone, category or operation, retry_after_sec,
+                         message=f"rpc {rpc} deferred by {budget}; not dispatched, retry in {retry_after_sec:.1f}s")
+        self.rpc, self.operation, self.budget = rpc, operation, budget
+        self.rpc_category = category
+        self.source, self.rpc_dispatched = "local", False
 
 
 @dataclass(frozen=True)
 class RpcDispatchPolicy:
-    """Classification of RPC classes into gate operation tags.
-
-    ``operations`` maps a TL request class (or its ``__name__`` for
-    duck-typed doubles) to a registered operation tag, or to ``None`` for an
-    explicit exemption. RPC classes missing from the map classify as
-    ``rpc:<Name>`` — unregistered, so the gate's warn-once default category
-    (#10) applies, and ``strict_categories=True`` gates fail closed (#29).
-    """
-
-    operations: Mapping[object, str | None] = field(
-        default_factory=lambda: dict(DEFAULT_RPC_OPERATIONS)
-    )
+    operations: Mapping[object, str | None] = field(default_factory=lambda: dict(DEFAULT_RPC_OPERATIONS))
 
     def operation_for(self, request: Any) -> str | None:
         request_type = type(request)
         if request_type in self.operations:
             return self.operations[request_type]
-        if request_type.__name__ in self.operations:
-            return self.operations[request_type.__name__]
-        return f"rpc:{request_type.__name__}"
+        return self.operations.get(request_type.__name__, f"rpc:{request_type.__name__}")
 
 
 AdmissionHook = Callable[[RpcDispatchAdmission], float]
 DecisionHook = Callable[[RpcDispatchDecision], None]
 FloodHook = Callable[[float, str], None]
+ResultHook = Callable[[RpcDispatchAdmission, BaseException | None], None]
 
 
 class RpcDispatchGate:
-    """Live attachment of a gate to one client's dispatch boundary.
+    """One attachment per client; account budgets survive reconnections."""
 
-    Created by :func:`attach_rpc_gate`; ``detach`` restores every wrapped
-    callable. Instances are not thread-safe — like everything in this
-    package, they belong to the client's event loop.
-    """
-
-    def __init__(
-        self,
-        client: Any,
-        gate: TelegramRateLimitGate,
-        phone: str,
-        *,
-        policy: RpcDispatchPolicy | None = None,
-        admissions: Sequence[AdmissionHook] = (),
-        on_decision: DecisionHook | None = None,
-        on_flood: FloodHook | None = None,
-        flood_feedback: bool = False,
-    ) -> None:
-        self._client = client
-        self._gate = gate
-        self._phone = phone
-        self._policy = policy if policy is not None else RpcDispatchPolicy()
-        self._admissions = tuple(admissions)
-        self._on_decision = on_decision
-        self._on_flood = on_flood
-        self._flood_feedback = flood_feedback
+    def __init__(self, client: Any, gate: TelegramRateLimitGate, phone: str, *,
+                 policy: RpcDispatchPolicy | None = None, admissions: Sequence[AdmissionHook] = (),
+                 budgets: Sequence[RpcDispatchBudget] = (), on_decision: DecisionHook | None = None,
+                 on_flood: FloodHook | None = None, on_result: ResultHook | None = None,
+                 flood_feedback: bool = False,
+                 sleep: Callable[[float], Awaitable[None]] = asyncio.sleep) -> None:
+        self._client, self._gate, self._phone = client, gate, phone
+        self._policy = policy or RpcDispatchPolicy()
+        self._admissions, self._budgets = tuple(admissions), tuple(budgets)
+        self._on_decision, self._on_flood, self._on_result = on_decision, on_flood, on_result
+        self._flood_feedback, self._sleep = flood_feedback, sleep
         self._patched_senders: list[tuple[Any, Any]] = []
         self._patched_methods: list[tuple[Any, str, Any | None]] = []
+        self._pending: set[asyncio.Task] = set()
+        self._attached = False
+        if any(b.mode not in {"wait", "defer"} for b in budgets):
+            raise ValueError("budget mode must be wait or defer")
 
     def attach(self) -> None:
         if getattr(self._client, _DISPATCH_ATTR, None) is not None:
             raise ValueError("client is already attached to an rpc dispatch gate")
         try:
             self._wrap_send(self._client._sender)
-            self._wrap_method(
-                "_borrow_exported_sender", lambda sender: self._wrap_send(sender)
-            )
-            self._wrap_method(
-                "_get_cdn_client", lambda cdn_client: self._wrap_send(cdn_client._sender)
-            )
+            self._wrap_method("_borrow_exported_sender", self._wrap_send)
+            self._wrap_method("_get_cdn_client", lambda client: self._wrap_send(client._sender))
         except BaseException:
             self._restore()
             raise
+        self._attached = True
         setattr(self._client, _DISPATCH_ATTR, self)
 
     def detach(self) -> None:
         if getattr(self._client, _DISPATCH_ATTR, None) is not self:
             raise ValueError("client is not attached to this rpc dispatch gate")
+        self._attached = False
+        for task in tuple(self._pending):
+            task.cancel()
         self._restore()
         delattr(self._client, _DISPATCH_ATTR)
 
-    # -- wrapping ------------------------------------------------------------
-
     def _wrap_send(self, sender: Any) -> None:
         if getattr(sender, _ORIGINAL_SEND_ATTR, None) is not None:
-            return  # borrowed senders are cached per DC: wrap once
+            return
         original = sender.send
 
         def gated_send(request: Any, ordered: bool = False) -> Any:
@@ -261,9 +241,6 @@ class RpcDispatchGate:
             on_result(result)
             return result
 
-        # Records whether the instance carried its own attribute before us so
-        # detach restores an instance attr (e.g. a test double) or removes
-        # ours to reveal the class method again.
         self._patched_methods.append((self._client, name, original if had_own else None))
         setattr(self._client, name, wrapped)
 
@@ -272,156 +249,210 @@ class RpcDispatchGate:
             sender.send = original
             delattr(sender, _ORIGINAL_SEND_ATTR)
         self._patched_senders.clear()
-        for client, name, own_original in self._patched_methods:
-            if own_original is None:
+        for client, name, original in self._patched_methods:
+            if original is None:
                 delattr(client, name)
             else:
-                setattr(client, name, own_original)
+                setattr(client, name, original)
         self._patched_methods.clear()
 
-    # -- admission -----------------------------------------------------------
+    def _classify(self, request: Any) -> RpcDispatchAdmission:
+        leaf = _leaf(request)
+        rpc = type(leaf).__name__
+        infrastructure = type(leaf) in _INFRASTRUCTURE
+        operation = None if infrastructure else self._policy.operation_for(leaf)
+        category = self._gate.category_for(operation) if operation is not None else None
+        peer = peer_key(getattr(leaf, "peer", None)) or peer_key(getattr(leaf, "to_peer", None))
+        return RpcDispatchAdmission(self._phone, rpc, operation or f"rpc:{rpc}", category, peer,
+                                    rpc in _READ_ONLY_NAMES or infrastructure, infrastructure)
 
-    def _dispatch(self, original: Callable[..., Any], request: Any, ordered: bool) -> Any:
-        single = not utils.is_list_like(request)
-        members = [request] if single else list(request)
+    @staticmethod
+    def _delay(value: float) -> float:
+        delay = float(value)
+        if not isfinite(delay) or delay < 0:
+            raise ValueError("budget delay must be finite and non-negative")
+        return delay
 
-        decisions: list[RpcDispatchDecision] = []
-        for rpc in members:
-            rpc_name = type(rpc).__name__
-            operation = self._policy.operation_for(rpc)
-            if operation is None:  # explicit exemption: no charge, no hook
-                decisions.append(self._decision(rpc_name, None, None, None, True, 0.0))
+    def _check(self, members: Sequence[RpcDispatchAdmission]) -> float:
+        priced = [(m.category, m.peer) for m in members if m.category is not None]
+        delay = self._gate.peek_batch(self._phone, priced)
+        if delay > 0:
+            self._refuse(members, delay, "gate", refused=next(m for m in members if m.category is not None))
+        waiting = 0.0
+        for budget in self._budgets:
+            selected = [m for m in members if budget.applies(m)]
+            if not selected:
                 continue
-            category = self._gate.category_for(operation)
-            peer = peer_key(getattr(rpc, "peer", None)) or peer_key(
-                getattr(rpc, "to_peer", None)
-            )
-            defer = self._gate.try_acquire(self._phone, category, peer=peer)
-            admission = RpcDispatchAdmission(
-                phone=self._phone, rpc=rpc_name, operation=operation,
-                category=category, peer=peer,
-            )
+            delay = self._delay(budget.peek_batch(selected))
+            if budget.max_batch_size is not None and len(selected) > budget.max_batch_size:
+                self._refuse(members, max(delay, 1.0), budget.name, refused=selected[0])
+            if delay > 0 and budget.mode == "defer":
+                self._refuse(members, delay, budget.name, refused=selected[0])
+            waiting = max(waiting, delay)
+        if waiting > 0:
+            return waiting
+        for member in members:
             for hook in self._admissions:
-                hook_defer = float(hook(admission))
-                if hook_defer > defer:
-                    defer = hook_defer
-            decisions.append(
-                self._decision(rpc_name, operation, category, peer, defer <= 0, defer)
-            )
-            if defer > 0:
-                for decision in decisions:
-                    self._emit(decision)
-                raise TelegramRpcDeferredError(self._phone, operation, defer, rpc_name)
+                delay = self._delay(hook(member))
+                if delay > 0:
+                    self._refuse(members, delay, "admission", refused=member)
+        return 0.0
 
-        for decision in decisions:
-            self._emit(decision)
+    def _refuse(self, members: Sequence[RpcDispatchAdmission], delay: float, budget: str,
+                *, refused: RpcDispatchAdmission | None = None) -> None:
+        refused = refused or members[0]
+        for member in members:
+            self._emit(member, admitted=False, delay=delay)
+        exc = TelegramRpcDeferredError(self._phone, refused.operation, delay, refused.rpc,
+                                      category=refused.category, budget=budget)
+        exc.rpc_read_only = refused.read_only
+        raise exc
 
-        futures = original(request, ordered=ordered)
-        observed = (
-            zip(members, futures) if isinstance(futures, list) else [(members[0], futures)]
-        )
-        for rpc, future in observed:
-            future.add_done_callback(
-                lambda fut, rpc_name=type(rpc).__name__: self._observe_flood(rpc_name, fut)
-            )
+    def _send(self, original: Callable, request: Any, ordered: bool,
+              members: Sequence[RpcDispatchAdmission]) -> Any:
+        application = [m for m in members if not m.infrastructure]
+        self._gate.commit_batch(self._phone, [(m.category, m.peer) for m in application if m.category is not None])
+        for budget in self._budgets:
+            selected = [m for m in application if budget.applies(m)]
+            if selected:
+                budget.commit_batch(selected)
+        # No await between the final check, commits and sender invocation.
+        for member in members:
+            self._emit(member, admitted=True, dispatched=True)
+        try:
+            futures = original(request, ordered=ordered)
+        except BaseException as exc:
+            for member in members:
+                self._result(member, exc)
+            raise
+        actual = futures if isinstance(futures, list) else [futures]
+        for member, future in zip(members, actual):
+            if future.done():
+                self._observe(member, future)
+            else:
+                future.add_done_callback(lambda fut, m=member: self._observe(m, fut))
         return futures
 
-    def _decision(
-        self,
-        rpc: str,
-        operation: str | None,
-        category: str | None,
-        peer: str | None,
-        admitted: bool,
-        defer_sec: float,
-    ) -> RpcDispatchDecision:
-        return RpcDispatchDecision(
-            phone=self._phone,
-            rpc=rpc,
-            operation=operation,
-            category=category,
-            peer=peer,
-            admitted=admitted,
-            defer_sec=defer_sec,
-        )
+    def _dispatch(self, original: Callable, request: Any, ordered: bool) -> Any:
+        batch = utils.is_list_like(request)
+        request = list(request) if batch else request
+        members = [self._classify(r) for r in request] if batch else [self._classify(request)]
+        application = [m for m in members if not m.infrastructure]
+        if not application:
+            return self._send(original, request, ordered, members)
+        if any(b.mode == "wait" or b.prepare is not None for b in self._budgets):
+            return self._schedule(original, request, ordered, members, application, batch)
+        self._check(application)
+        return self._send(original, request, ordered, members)
 
-    def _emit(self, decision: RpcDispatchDecision) -> None:
-        if self._on_decision is None:
-            return
-        try:
-            self._on_decision(decision)
-        except Exception:  # noqa: BLE001 — metadata must never break dispatch
-            logger.warning(
-                "on_decision callback raised for %s", decision.rpc, exc_info=True
-            )
+    def _schedule(self, original: Callable, request: Any, ordered: bool,
+                  members: Sequence[RpcDispatchAdmission], application: Sequence[RpcDispatchAdmission],
+                  batch: bool) -> Any:
+        loop = asyncio.get_running_loop()
+        outputs = [loop.create_future() for _ in members]
+        # Telethon stops awaiting a batch on non-RPC exceptions (local refusal
+        # included). Observe the sibling failures too, without hiding them
+        # from anyone who does await those futures.
+        for output in outputs:
+            output.add_done_callback(lambda f: None if f.cancelled() else f.exception())
+        sent = False
 
-    def _observe_flood(self, rpc_name: str, future: Any) -> None:
-        if future.cancelled():
-            return
-        exception = future.exception()
-        if not isinstance(exception, _FLOOD_ERRORS):
-            return
-        seconds = float(getattr(exception, "seconds", 0.0) or 0.0)
-        if self._on_flood is not None:
+        async def dispatch() -> None:
+            nonlocal sent
             try:
-                self._on_flood(seconds, rpc_name)
-            except Exception:  # noqa: BLE001 — metadata must never break dispatch
-                logger.warning(
-                    "on_flood callback raised for %s", rpc_name, exc_info=True
-                )
-        if self._flood_feedback:
-            self._gate.note_flood(self._phone, seconds)
+                while True:
+                    for budget in self._budgets:
+                        if budget.prepare is not None:
+                            await budget.prepare([m for m in application if budget.applies(m)])
+                    delay = self._check(application)
+                    if delay <= 0:
+                        break
+                    await self._sleep(delay)
+                if any(f.cancelled() for f in outputs) or not self._attached:
+                    raise asyncio.CancelledError
+                actual = self._send(original, request, ordered, members)
+                sent = True
+                inputs = actual if isinstance(actual, list) else [actual]
+                for output, future in zip(outputs, inputs):
+                    future.add_done_callback(lambda f, out=output: relay(f, out))
+                    output.add_done_callback(lambda out, f=future: f.cancel() if out.cancelled() else None)
+            except asyncio.CancelledError:
+                for output in outputs:
+                    output.cancel()
+            except Exception as exc:
+                for output in outputs:
+                    if not output.done():
+                        output.set_exception(exc)
+
+        def relay(future: asyncio.Future, output: asyncio.Future) -> None:
+            if future.cancelled():
+                output.cancel()
+                return
+            exception = future.exception()
+            if output.done():
+                return
+            if exception is not None:
+                output.set_exception(exception)
+            else:
+                output.set_result(future.result())
+
+        task = loop.create_task(dispatch(), name="telethon-rpc-admission")
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
+        task.add_done_callback(lambda done: [f.cancel() for f in outputs] if done.cancelled() else None)
+        for output in outputs:
+            output.add_done_callback(lambda f: task.cancel() if f.cancelled() and not sent else None)
+        return outputs if batch else outputs[0]
+
+    def _emit(self, member: RpcDispatchAdmission, *, admitted: bool, delay: float = 0,
+              dispatched: bool = False) -> None:
+        if self._on_decision is not None:
+            decision = RpcDispatchDecision(member.phone, member.rpc,
+                                           None if member.infrastructure else member.operation,
+                                           member.category, member.peer, admitted, delay, dispatched, member.read_only)
+            self._callback(self._on_decision, decision)
+
+    @staticmethod
+    def _callback(callback: Callable, *args: Any) -> None:
+        try:
+            callback(*args)
+        except Exception:
+            logger.warning("RPC observer failed", exc_info=True)
+
+    def _observe(self, member: RpcDispatchAdmission, future: asyncio.Future) -> None:
+        self._result(member, asyncio.CancelledError() if future.cancelled() else future.exception())
+
+    def _result(self, member: RpcDispatchAdmission, exception: BaseException | None) -> None:
+        if exception is not None:
+            exception.rpc = member.rpc
+            exception.rpc_category = member.category
+            exception.rpc_read_only = member.read_only
+            exception.rpc_dispatched = True
+            exception.source = "telegram" if isinstance(exception, _FLOOD_ERRORS) else "transport"
+        if self._on_result is not None and not member.infrastructure:
+            self._callback(self._on_result, member, exception)
+        if isinstance(exception, _FLOOD_ERRORS):
+            seconds = float(getattr(exception, "seconds", 0.0) or 0.0)
+            if self._on_flood is not None:
+                self._callback(self._on_flood, seconds, member.rpc)
+            if self._flood_feedback:
+                self._gate.note_flood(self._phone, seconds)
 
 
-def attach_rpc_gate(
-    client: Any,
-    gate: TelegramRateLimitGate,
-    phone: str,
-    *,
-    policy: RpcDispatchPolicy | None = None,
-    admissions: Sequence[AdmissionHook] = (),
-    on_decision: DecisionHook | None = None,
-    on_flood: FloodHook | None = None,
-    flood_feedback: bool = False,
-) -> RpcDispatchGate:
-    """Enforce flood control at the client's RPC dispatch boundary (#34).
+def attach_rpc_gate(client: Any, gate: TelegramRateLimitGate, phone: str, *,
+                    policy: RpcDispatchPolicy | None = None, admissions: Sequence[AdmissionHook] = (),
+                    budgets: Sequence[RpcDispatchBudget] = (), on_decision: DecisionHook | None = None,
+                    on_flood: FloodHook | None = None, on_result: ResultHook | None = None,
+                    flood_feedback: bool = False,
+                    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep) -> RpcDispatchGate:
+    """Attach before connect; use two-phase budgets for mutable limiter state.
 
-    Every RPC the client dispatches — public calls, nested entity resolves,
-    paginated writes, upload/download parts, exported/CDN senders, native
-    object and event-builder traffic, each actual retry attempt — is charged
-    once against ``gate`` (per ``phone``) and each ``admissions`` hook before
-    it is sent. An exhausted budget raises :class:`TelegramRpcDeferredError`
-    and nothing is dispatched.
-
-    ``phone`` is the caller-supplied account identity: concurrent clients of
-    the same account share the gate's budgets; reconnections keep the same
-    sender instance, so budgets never reset. Attaching twice raises;
-    ``detach`` on the returned handle restores the original send callables
-    (flood observations for responses already in flight may still fire).
-
-    Callbacks are synchronous and event-loop affine: ``on_decision`` sees one
-    :class:`RpcDispatchDecision` per dispatched member/attempt, ``on_flood``
-    sees ``(seconds, rpc_name)`` for pacing floods surfacing through the
-    boundary. ``flood_feedback=True`` additionally feeds those waits into
-    ``gate.note_flood`` — enable it only when no call site ALSO reports the
-    same flood via ``handle_flood_wait(..., gate=...)``, or backoff
-    double-counts (see the gate docs).
-
-    ``admissions`` hooks receive an :class:`RpcDispatchAdmission` and return
-    seconds-to-defer (``0.0`` = admitted), mirroring ``try_acquire``; a
-    positive return refuses the dispatch. This is where an existing username
-    budget plugs in: hidden ``ResolveUsername`` fan-out stops dispatching
-    once the budget is exhausted.
+    Legacy admissions remain non-mutating validation predicates. Wait budgets
+    recheck all budgets after waiting. Each actual RPC retry is charged again;
+    this integration never introduces automatic write replay.
     """
-    handle = RpcDispatchGate(
-        client,
-        gate,
-        phone,
-        policy=policy,
-        admissions=admissions,
-        on_decision=on_decision,
-        on_flood=on_flood,
-        flood_feedback=flood_feedback,
-    )
+    handle = RpcDispatchGate(client, gate, phone, policy=policy, admissions=admissions,
+                             budgets=budgets, on_decision=on_decision, on_flood=on_flood,
+                             on_result=on_result, flood_feedback=flood_feedback, sleep=sleep)
     handle.attach()
     return handle

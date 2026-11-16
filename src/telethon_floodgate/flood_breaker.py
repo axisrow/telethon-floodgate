@@ -184,6 +184,31 @@ class FloodCircuitBreaker:
             )
             self._probe_in_flight[key] = now
 
+    def peek(self, operation: str, phone: str | None, *, slots: int = 1) -> float:
+        """Non-claiming admission check for composition with dispatch budgets."""
+        if not phone:
+            return 0.0
+        key = (operation, phone)
+        state = self._states.get(key, _CLOSED)
+        if state == _CLOSED:
+            return 0.0
+        now = self._time()
+        if state == _OPEN:
+            remaining = self._cooldown_remaining(key, now)
+            if remaining is not None:
+                return remaining
+        granted = self._probe_in_flight.get(key)
+        if granted is not None and now - granted < self._cooldown_seconds * PROBE_RECLAIM_AFTER_COOLDOWNS:
+            return min(self._cooldown_seconds, HALF_OPEN_RETRY_HINT_SECONDS)
+        return min(self._cooldown_seconds, HALF_OPEN_RETRY_HINT_SECONDS) if slots > 1 else 0.0
+
+    def release_probe(self, operation: str, phone: str | None) -> None:
+        """Release an aborted/non-flood probe without erasing flood evidence."""
+        key = (operation, phone)
+        if self._probe_in_flight.pop(key, None) is not None:
+            self._states[key] = _OPEN
+            self._open_until[key] = self._time()
+
     def record_flood(self, operation: str, phone: str | None) -> None:
         """Count a flood wait against this (operation, phone)."""
         if not phone:
