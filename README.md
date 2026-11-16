@@ -188,6 +188,61 @@ handled FLOOD_WAIT also feeds the gate's optional adaptive backoff — no
 manual wiring needed. Don't ALSO call `note_flood` from a `report_flood`
 hook when passing `gate=`: that double-counts.
 
+## RPC dispatch boundary — every RPC through the gate (opt-in, #34)
+
+Public-call gating cannot see the RPCs Telethon makes behind a consumer's
+back: cold-cache entity resolution inside `send_message`, mention-link
+fan-out, paginated writes (`delete_messages` chunks), upload parts,
+downloads and big-file traffic on exported/CDN senders, retries inside
+Telethon's `_call` loop, and calls from native objects (`Message.reply`) or
+event-builder resolution. `attach_rpc_gate` wraps the one seam all of them
+share — each sender's `send` — so every actual dispatch attempt is charged
+against your existing gate before anything is sent:
+
+```python
+from telethon_floodgate import attach_rpc_gate
+
+handle = attach_rpc_gate(
+    client, gate, phone,
+    admissions=[username_limiter.allow],   # your own budgets, e.g. resolves
+    on_decision=metrics.observe,           # structured per-attempt metadata
+    on_flood=lambda sec, rpc: log.info("flood %ss on %s", sec, rpc),
+)
+...
+handle.detach()                            # restores the original send callables
+```
+
+Lifecycle: attach once after creating the client (reconnections keep the
+same sender, so budgets never reset and nothing stacks); attach twice
+raises; `detach` restores exactly what was there before, including
+consumer-installed transport recorders. All telethon versions with
+`MTProtoSender.send` returning futures (1.x, tested against 1.45) are
+supported.
+
+Accounting policy — classified by the actual RPC, not the outer tag:
+
+| RPC family | Operation tag | Category |
+| --- | --- | --- |
+| `SendMessage` / `SendMedia` / `SendMultiMedia` / `EditMessage` / `ForwardMessages` | `rpc_send` | `send` (+ per-peer bucket) |
+| `ResolveUsername` | `rpc_resolve` | `resolve` (no-op; enforce with an `admissions` hook) |
+| upload parts / `GetFile` / CDN file | `rpc_upload` / `rpc_download` | `default` (deliberately not send/history quota) |
+| history/search/read pages | exempt | — (`wrap_messages_iterator` owns that budget; re-pricing pages here would silently halve it) |
+| anything else | `rpc:<Name>` (warn-once) | `default`; with `strict_categories=True` it fails closed instead |
+
+A refusal raises `TelegramRpcDeferredError` (a `TelegramRateLimitedError`
+subclass) and nothing is dispatched — the boundary never sleeps; waiting is
+the caller's job (`gate.acquire`). One dispatch is charged once to each
+applicable budget; batch members and genuine retry attempts are charged
+individually. Flood waits surfacing through the boundary reach `on_flood`;
+`flood_feedback=True` additionally feeds `gate.note_flood` — enable it only
+if no call site also reports the same flood via `handle_flood_wait(...,
+gate=...)`, or backoff double-counts.
+
+Limitations: multi-member batches admit members sequentially, so a
+mid-batch refusal may leave earlier members' slots consumed (undispatched —
+conservative direction). Multi-hop CDN re-upload chains beyond the first hop
+and connection-level resends after a reconnect are not separately charged.
+
 ## Design notes
 
 - Everything runs on one event loop with in-memory state and no DB. The gate
