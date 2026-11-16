@@ -130,7 +130,19 @@ async def handle_flood_wait(
         phone=phone,
     )
 
-    if pool is not None and phone:
+    # A dispatch observer may own durable, family-aware reporting. Wait for
+    # that owner before an outer helper considers the legacy account-wide
+    # fallback; otherwise a read-family flood would freeze writes as well.
+    reporting = getattr(exc, "flood_reporting", None)
+    if isinstance(reporting, asyncio.Future):
+        try:
+            await asyncio.shield(reporting)
+        except asyncio.CancelledError:
+            if not reporting.cancelled():
+                raise
+        except Exception:
+            logger.warning("Dispatch flood reporter failed; using fallback", exc_info=True)
+    if pool is not None and phone and getattr(exc, "flood_reported", False) is not True:
         reporter = getattr(pool, "report_flood", None)
         if callable(reporter):
             # The pool object belongs to the consumer: sync hooks are just as
@@ -139,6 +151,7 @@ async def handle_flood_wait(
             reported = reporter(phone, wait_seconds)
             if inspect.isawaitable(reported):
                 await reported
+            exc.flood_reported = True
 
     active_logger = logger_ or logger
 
@@ -229,7 +242,11 @@ async def run_with_flood_wait(
             gate=gate,
             logger_=logger_,
         )
-        raise HandledFloodWaitError(info) from exc
+        handled = HandledFloodWaitError(info)
+        for name in ("rpc", "rpc_category", "rpc_read_only", "rpc_dispatched", "source", "flood_reported"):
+            if hasattr(exc, name):
+                setattr(handled, name, getattr(exc, name))
+        raise handled from exc
 
 
 async def run_with_flood_wait_retry(

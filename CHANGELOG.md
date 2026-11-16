@@ -2,6 +2,9 @@
 
 ## 0.1.10 (unreleased)
 
+- Preserve single ownership of durable flood reporting through outer helpers:
+  await `flood_reporting` and honor `flood_reported` before account-wide fallback.
+
 - Classify the inner RPC of transparent query wrappers; disabling updates no
   longer exempts all application traffic. Keepalive and connection handshakes
   remain explicit infrastructure exceptions.

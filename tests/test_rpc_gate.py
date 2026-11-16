@@ -10,12 +10,15 @@ themselves would prove nothing about nested-RPC coverage.
 import asyncio
 import datetime
 import inspect
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from telethon import TelegramClient, errors, functions, types, utils
 from telethon.sessions import MemorySession
 
 from telethon_floodgate import (
+    HandledFloodWaitError,
     RateLimitSpec,
     ResolveRateLimiter,
     RpcDispatchBudget,
@@ -24,6 +27,7 @@ from telethon_floodgate import (
     TelegramRpcDeferredError,
     TelegramUnregisteredOperationError,
     attach_rpc_gate,
+    run_with_flood_wait,
 )
 
 PHONE = "+15550001"
@@ -619,3 +623,32 @@ async def test_flood_rpc_metadata_available_to_caller_before_observer_finishes()
     assert caught.value.rpc_read_only is True
     assert caught.value.source == "telegram"
     assert len(recorder.dispatches) == 1
+
+
+async def test_outer_flood_helper_does_not_report_an_already_owned_flood_again():
+    client, recorder = make_client()
+    install_defaults(recorder)
+    recorder.flood_then(functions.contacts.ResolveUsernameRequest, errors.FloodWaitError(None, capture=3600))
+    reports = []
+    pending = []
+
+    def observe(member, exception):
+        if not isinstance(exception, errors.FloodWaitError):
+            return
+
+        async def report():
+            await asyncio.sleep(0)
+            reports.append(member.rpc)
+            exception.flood_reported = True
+
+        exception.flood_reporting = asyncio.create_task(report())
+        pending.append(exception.flood_reporting)
+
+    attach_rpc_gate(client, lifted_peer_gate(), PHONE, on_result=observe)
+    legacy = SimpleNamespace(report_flood=AsyncMock())
+    with pytest.raises(HandledFloodWaitError) as caught:
+        await run_with_flood_wait(client.send_message("newuser", "hi"), operation="send", phone=PHONE, pool=legacy)
+    await asyncio.gather(*pending)
+    legacy.report_flood.assert_not_awaited()
+    assert reports == ["ResolveUsernameRequest"]
+    assert caught.value.info.rpc == "ResolveUsernameRequest"

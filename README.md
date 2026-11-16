@@ -242,6 +242,12 @@ remains supported. Choose exactly one flood-feedback owner; enabling both
 `flood_feedback=True` and consumer `handle_flood_wait(..., gate=...)` would
 report the same flood twice. The guard never automatically replays a write.
 
+A consumer that owns durable flood reporting can put its completion Future
+on `exception.flood_reporting` and set `exception.flood_reported = True` after
+success. The flood helpers await that owner before considering their legacy
+pool-report fallback. This prevents an outer send helper from reporting an
+already scoped resolve flood as an account-wide send flood.
+
 Repeated attach raises; detach restores the original sender callables and
 cancels pending admission waits. Reattach with the same budget objects.
 Supported Telethon 1.x dispatch Futures are exercised offline at the sender
