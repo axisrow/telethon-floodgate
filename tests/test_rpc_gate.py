@@ -652,3 +652,22 @@ async def test_outer_flood_helper_does_not_report_an_already_owned_flood_again()
     legacy.report_flood.assert_not_awaited()
     assert reports == ["ResolveUsernameRequest"]
     assert caught.value.info.rpc == "ResolveUsernameRequest"
+
+
+async def test_short_gate_wait_is_opt_in_and_rechecks_before_second_send():
+    client, recorder = make_client()
+    install_defaults(recorder)
+    clock = [100.0]
+    gate = TelegramRateLimitGate(time_func=lambda: clock[0])
+    waits = []
+
+    async def advance(seconds):
+        waits.append(seconds)
+        clock[0] += seconds + 0.001
+
+    attach_rpc_gate(client, gate, PHONE, gate_wait_max_sec=5.0, sleep=advance)
+    for text in ("first", "second"):
+        await client.send_message(types.InputPeerUser(7, 42), text)
+    assert len(waits) == 1 and 0 < waits[0] <= 5.0
+    assert len(recorder.dispatches) == 2
+    assert gate.snapshot(PHONE)["categories"]["send"]["used"] == 2

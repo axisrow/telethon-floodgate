@@ -248,6 +248,13 @@ success. The flood helpers await that owner before considering their legacy
 pool-report fallback. This prevents an outer send helper from reporting an
 already scoped resolve flood as an account-wide send flood.
 
+`gate_wait_max_sec` optionally waits for small category/peer deferrals instead
+of aborting an interactive flow between prompts. It defaults to zero (the
+existing refusal behavior). Every wakeup rechecks all budgets; larger gate
+deferrals and consumer `defer` budgets still refuse. The caller's operation
+deadline bounds the flow. Waiting occurs before dispatch, never by replaying
+an earlier write.
+
 Repeated attach raises; detach restores the original sender callables and
 cancels pending admission waits. Reattach with the same budget objects.
 Supported Telethon 1.x dispatch Futures are exercised offline at the sender

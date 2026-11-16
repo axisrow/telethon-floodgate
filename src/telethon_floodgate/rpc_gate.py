@@ -185,12 +185,14 @@ class RpcDispatchGate:
                  budgets: Sequence[RpcDispatchBudget] = (), on_decision: DecisionHook | None = None,
                  on_flood: FloodHook | None = None, on_result: ResultHook | None = None,
                  flood_feedback: bool = False,
+                 gate_wait_max_sec: float = 0.0,
                  sleep: Callable[[float], Awaitable[None]] = asyncio.sleep) -> None:
         self._client, self._gate, self._phone = client, gate, phone
         self._policy = policy or RpcDispatchPolicy()
         self._admissions, self._budgets = tuple(admissions), tuple(budgets)
         self._on_decision, self._on_flood, self._on_result = on_decision, on_flood, on_result
         self._flood_feedback, self._sleep = flood_feedback, sleep
+        self._gate_wait_max_sec = self._delay(gate_wait_max_sec)
         self._patched_senders: list[tuple[Any, Any]] = []
         self._patched_methods: list[tuple[Any, str, Any | None]] = []
         self._pending: set[asyncio.Task] = set()
@@ -276,9 +278,9 @@ class RpcDispatchGate:
     def _check(self, members: Sequence[RpcDispatchAdmission]) -> float:
         priced = [(m.category, m.peer) for m in members if m.category is not None]
         delay = self._gate.peek_batch(self._phone, priced)
-        if delay > 0:
+        if delay > 0 and (self._gate_wait_max_sec == 0 or delay > self._gate_wait_max_sec):
             self._refuse(members, delay, "gate", refused=next(m for m in members if m.category is not None))
-        waiting = 0.0
+        waiting = delay
         for budget in self._budgets:
             selected = [m for m in members if budget.applies(m)]
             if not selected:
@@ -340,7 +342,7 @@ class RpcDispatchGate:
         application = [m for m in members if not m.infrastructure]
         if not application:
             return self._send(original, request, ordered, members)
-        if any(b.mode == "wait" or b.prepare is not None for b in self._budgets):
+        if self._gate_wait_max_sec > 0 or any(b.mode == "wait" or b.prepare is not None for b in self._budgets):
             return self._schedule(original, request, ordered, members, application, batch)
         self._check(application)
         return self._send(original, request, ordered, members)
@@ -444,6 +446,7 @@ def attach_rpc_gate(client: Any, gate: TelegramRateLimitGate, phone: str, *,
                     budgets: Sequence[RpcDispatchBudget] = (), on_decision: DecisionHook | None = None,
                     on_flood: FloodHook | None = None, on_result: ResultHook | None = None,
                     flood_feedback: bool = False,
+                    gate_wait_max_sec: float = 0.0,
                     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep) -> RpcDispatchGate:
     """Attach before connect; use two-phase budgets for mutable limiter state.
 
@@ -453,6 +456,7 @@ def attach_rpc_gate(client: Any, gate: TelegramRateLimitGate, phone: str, *,
     """
     handle = RpcDispatchGate(client, gate, phone, policy=policy, admissions=admissions,
                              budgets=budgets, on_decision=on_decision, on_flood=on_flood,
-                             on_result=on_result, flood_feedback=flood_feedback, sleep=sleep)
+                             on_result=on_result, flood_feedback=flood_feedback,
+                             gate_wait_max_sec=gate_wait_max_sec, sleep=sleep)
     handle.attach()
     return handle

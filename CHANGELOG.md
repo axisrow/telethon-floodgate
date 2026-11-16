@@ -2,6 +2,10 @@
 
 ## 0.1.10 (unreleased)
 
+- Optional `gate_wait_max_sec` paces short category/peer deferrals before
+  dispatch, preserving multi-prompt native conversation flows; default
+  refusal behavior and quota values remain unchanged.
+
 - Preserve single ownership of durable flood reporting through outer helpers:
   await `flood_reporting` and honor `flood_reported` before account-wide fallback.
 
