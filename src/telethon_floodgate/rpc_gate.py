@@ -96,6 +96,16 @@ DEFAULT_RPC_OPERATIONS: dict[object, str | None] = {
     tl_functions.messages.GetScheduledHistoryRequest: None,
     tl_functions.messages.GetMessagesRequest: None,
     tl_functions.channels.GetMessagesRequest: None,
+    # Library infrastructure, not application traffic: the sender dispatches
+    # PingRequest itself every ~60s (mtprotosender._keepalive_ping) and every
+    # connect — including each automatic reconnection — sends the
+    # InvokeWithLayer(init) handshake (telegrambaseclient.connect). Charging
+    # them would count the library staying alive against a quota; refusing
+    # them under strict_categories would kill the keepalive task (it catches
+    # only ConnectionError/CancelledError) and break reconnection outright.
+    tl_functions.PingRequest: None,
+    tl_functions.InvokeWithLayerRequest: None,
+    tl_functions.InvokeWithoutUpdatesRequest: None,
 }
 
 
@@ -386,7 +396,8 @@ def attach_rpc_gate(
     ``phone`` is the caller-supplied account identity: concurrent clients of
     the same account share the gate's budgets; reconnections keep the same
     sender instance, so budgets never reset. Attaching twice raises;
-    ``detach`` on the returned handle restores the original send callables.
+    ``detach`` on the returned handle restores the original send callables
+    (flood observations for responses already in flight may still fire).
 
     Callbacks are synchronous and event-loop affine: ``on_decision`` sees one
     :class:`RpcDispatchDecision` per dispatched member/attempt, ``on_flood``

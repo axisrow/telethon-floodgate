@@ -242,6 +242,9 @@ Limitations: multi-member batches admit members sequentially, so a
 mid-batch refusal may leave earlier members' slots consumed (undispatched —
 conservative direction). Multi-hop CDN re-upload chains beyond the first hop
 and connection-level resends after a reconnect are not separately charged.
+`on_flood`/`flood_feedback` may still fire for responses still in flight
+when `detach` happens: detaching gates future dispatches, not requests
+already sent.
 
 ## Design notes
 

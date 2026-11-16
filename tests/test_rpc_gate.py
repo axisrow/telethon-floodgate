@@ -326,6 +326,31 @@ async def test_strict_categories_fail_closed_on_unknown_rpc():
     handle.detach()
 
 
+async def test_infrastructure_rpcs_exempt_even_in_strict_mode():
+    """Keepalive ping (sender-dispatched every ~60s) and the connect-init
+    invoke (every connection incl. auto-reconnect) must pass the boundary
+    without charging anything — strict mode must not kill the keepalive
+    task or reconnection over them."""
+    client, recorder = make_client()
+    pong = types.Pong(msg_id=1, ping_id=12345)
+    recorder.respond(functions.PingRequest, pong)
+    recorder.respond(functions.InvokeWithLayerRequest, pong)
+    recorder.respond(functions.InvokeWithoutUpdatesRequest, pong)
+    gate = TelegramRateLimitGate(strict_categories=True)
+    decisions: list = []
+    handle = attach_rpc_gate(client, gate, PHONE, on_decision=decisions.append)
+
+    await client._sender.send(functions.PingRequest(12345))
+    await client._sender.send(functions.InvokeWithLayerRequest(200, functions.help.GetConfigRequest()))
+    await client._sender.send(functions.InvokeWithoutUpdatesRequest(functions.PingRequest(12346)))
+
+    assert len(recorder.dispatches) == 3
+    assert [d.operation for d in decisions] == [None, None, None]
+    assert all(d.admitted for d in decisions)
+    assert gate.snapshot(PHONE)["categories"]["default"]["used"] == 0
+    handle.detach()
+
+
 async def test_event_filter_resolution_goes_through_boundary():
     """Event builders resolve their chats/filters via the same
     get_input_entity primitive (_into_id_set is what NewMessage(chats=...)
