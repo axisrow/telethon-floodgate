@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.9 (2026-11-17)
 
 - RPC dispatch-boundary enforcement (#34): new `rpc_gate.py` — opt-in
   `attach_rpc_gate(client, gate, phone, ...)` wraps `MTProtoSender.send` on
@@ -20,8 +20,6 @@
   `rpc_resolve`, `rpc_upload`, `rpc_download` keep strict mode working;
   existing categories unchanged. Offline contract tests drive real Telethon
   1.45 internals through a recording sender.
-
-## 0.1.9 (2026-11-14)
 
 - `telegram_fetch_me` remapped `resolve` → `history` (follow-up to 0.1.8,
   tg_content_factory#1805): "resolve" is not a default-configured bucket
