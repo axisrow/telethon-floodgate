@@ -60,6 +60,15 @@ from telethon_floodgate.rate_limiter import (
     UsernameResolveFloodWaitDeferredError,
     UsernameResolveRateLimitedError,
 )
+from telethon_floodgate.rpc_gate import (
+    DEFAULT_RPC_OPERATIONS,
+    RpcDispatchAdmission,
+    RpcDispatchDecision,
+    RpcDispatchGate,
+    RpcDispatchPolicy,
+    TelegramRpcDeferredError,
+    attach_rpc_gate,
+)
 from telethon_floodgate.token_bucket import TokenBucket
 
 __version__ = "0.1.7"
@@ -67,6 +76,7 @@ __version__ = "0.1.7"
 __all__ = [
     "DEFAULT_COOLDOWN_SECONDS",
     "DEFAULT_FLOOD_THRESHOLD",
+    "DEFAULT_RPC_OPERATIONS",
     "FLOOD_WAIT_RETRY_BUFFER_SEC",
     "FloodCircuitBreaker",
     "FloodReportingGate",
@@ -77,11 +87,17 @@ __all__ = [
     "RESOLVE_USERNAME_BACKOFF_BUFFER_SEC",
     "ResolveRateLimiter",
     "RateLimitSpec",
+    "RpcDispatchAdmission",
+    "RpcDispatchDecision",
+    "RpcDispatchGate",
+    "RpcDispatchPolicy",
     "TelegramOperationSuspendedError",
     "TelegramPeerRateLimitedError",
     "TelegramRateLimitedError",
     "TelegramRateLimitGate",
+    "TelegramRpcDeferredError",
     "TelegramUnregisteredOperationError",
+    "attach_rpc_gate",
     "TokenBucket",
     "TRANSIENT_FLOOD_WAIT_MAX_SEC",
     "TRANSIENT_FLOOD_WAIT_RETRY_BUDGET_SEC",

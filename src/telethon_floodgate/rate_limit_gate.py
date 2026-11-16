@@ -127,6 +127,15 @@ _OPERATION_CATEGORIES = {
     # without it silently priced fetch_me at default again (0.1.9 remap).
     "telegram_fetch_me": "history",
     "telegram_invoke_request": "history",
+    # RPC dispatch-boundary tags (issue #34, rpc_gate.py): the boundary
+    # classifies by the actual TL RPC, not the outer operation tag. Transfers
+    # land in "default" on purpose — upload/download traffic must not eat the
+    # calibrated send/history quotas; consumers with real transfer volume
+    # should register a dedicated category via category_limits.
+    "rpc_send": "send",
+    "rpc_resolve": "resolve",
+    "rpc_upload": "default",
+    "rpc_download": "default",
 }
 
 

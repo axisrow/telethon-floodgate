@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+- RPC dispatch-boundary enforcement (#34): new `rpc_gate.py` — opt-in
+  `attach_rpc_gate(client, gate, phone, ...)` wraps `MTProtoSender.send` on
+  the client's main sender plus exported (`_borrow_exported_sender`) and CDN
+  senders, so nested RPCs (cold-cache resolves inside `send_message`,
+  mention-link fan-out), paginated writes, upload/download parts, native
+  object and event-builder traffic, and each genuine retry attempt are
+  charged against the shared gate before dispatch. Classification is by the
+  actual TL RPC (`DEFAULT_RPC_OPERATIONS`): send family → `send` (+peer),
+  `ResolveUsername` → no-op `rpc_resolve` (enforce username budgets via
+  `admissions` hooks), transfers → `default` (never send/history quotas),
+  read pages exempt (`wrap_messages_iterator` owns history), unknown RPCs →
+  warn-once `rpc:<Name>` and fail-closed under `strict_categories`. Refusals
+  raise `TelegramRpcDeferredError` (TelegramRateLimitedError subclass);
+  structured metadata via `on_decision`/`on_flood` (+opt-in
+  `flood_feedback` → `note_flood`). New registered tags `rpc_send`,
+  `rpc_resolve`, `rpc_upload`, `rpc_download` keep strict mode working;
+  existing categories unchanged. Offline contract tests drive real Telethon
+  1.45 internals through a recording sender.
+
 ## 0.1.9 (2026-11-14)
 
 - `telegram_fetch_me` remapped `resolve` → `history` (follow-up to 0.1.8,
