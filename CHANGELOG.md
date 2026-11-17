@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.1.10 (unreleased)
+
+- Optional `gate_wait_max_sec` paces short category/peer deferrals before
+  dispatch, preserving multi-prompt native conversation flows; default
+  refusal behavior and quota values remain unchanged.
+
+- Preserve single ownership of durable flood reporting through outer helpers:
+  await `flood_reporting` and honor `flood_reported` before account-wide fallback.
+
+- Classify the inner RPC of transparent query wrappers; disabling updates no
+  longer exempts all application traffic. Keepalive and connection handshakes
+  remain explicit infrastructure exceptions.
+- Compose category, peer and consumer budgets with two-phase batch admission;
+  local refusals spend no undispatched member slots. Category-exempt read RPCs
+  still pass consumer budgets. New `RpcDispatchBudget` supports asynchronous
+  process pacing while retaining Telethon's Future/list-of-Futures contract.
+- Account for retry attempts and expose curated per-RPC result metadata before
+  a completed Future is returned to its caller. Cancellation before admission
+  sends nothing; uncertain writes are never replayed by the guard.
+- Add non-claiming breaker `peek` and `release_probe`, aggregate gate
+  `peek_batch`/`commit_batch`, and optional RPC/source/delivery fields on
+  `FloodWaitInfo`. Existing limiter entry points remain compatible.
+- `release_probe` re-arms a released trial on a full fresh cooldown: an
+  already-expired deadline handed the very next caller an immediate trial,
+  so an abort loop never actually backed off. Pinned by new breaker tests
+  covering `peek` OPEN/half-open/live-probe and `release_probe` semantics.
+
+
 ## 0.1.9 (2026-11-17)
 
 - RPC dispatch-boundary enforcement (#34): new `rpc_gate.py` — opt-in

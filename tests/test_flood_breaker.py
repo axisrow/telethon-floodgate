@@ -365,3 +365,70 @@ def test_flooded_trial_releases_the_probe_claim():
     assert not breaker._probe_in_flight  # nothing left behind
 
 
+def test_peek_reports_the_remaining_cooldown_while_open():
+    """peek() is the non-claiming admission probe dispatch budgets compose
+    with: it must mirror check()'s refusal remainder without spending,
+    claiming the trial or moving any state."""
+    clock = _Clock()
+    breaker = _breaker(clock)
+    for _ in range(3):
+        breaker.record_flood(OP, PHONE)
+
+    clock.advance(120.0)
+    assert breaker.peek(OP, PHONE) == pytest.approx(180.0)
+    # Non-claiming: the real check() still refuses with the same remainder.
+    with pytest.raises(TelegramOperationSuspendedError) as exc:
+        breaker.check(OP, PHONE)
+    assert exc.value.retry_after_sec == pytest.approx(180.0)
+
+
+def test_peek_reports_the_short_hint_while_a_probe_is_live():
+    """While the single half-open trial is in flight, every peek -- whatever
+    the batch slot count -- prices the honest hint (#13), never an admit."""
+    clock = _Clock()
+    breaker = _breaker(clock)
+    for _ in range(3):
+        breaker.record_flood(OP, PHONE)
+
+    clock.advance(301.0)
+    breaker.check(OP, PHONE)  # one caller owns the trial
+    assert breaker.peek(OP, PHONE) == pytest.approx(HALF_OPEN_RETRY_HINT_SECONDS)
+    assert breaker.peek(OP, PHONE, slots=4) == pytest.approx(HALF_OPEN_RETRY_HINT_SECONDS)
+
+
+def test_peek_after_an_expired_cooldown_prices_batch_slots():
+    """A half-open trial carries exactly one RPC (#955): a single-slot peek
+    admits (the next check() grants the trial), but a multi-slot batch
+    cannot ride it and gets the hint instead."""
+    clock = _Clock()
+    breaker = _breaker(clock)
+    for _ in range(3):
+        breaker.record_flood(OP, PHONE)
+
+    clock.advance(301.0)  # cooldown elapsed; peek must not claim the trial
+    assert breaker.peek(OP, PHONE) == 0.0
+    assert breaker.peek(OP, PHONE, slots=3) == pytest.approx(
+        min(300.0, HALF_OPEN_RETRY_HINT_SECONDS)
+    )
+    breaker.record_success(OP, PHONE)
+    breaker.check(OP, PHONE)  # the trial is still there for a real caller
+
+
+def test_release_probe_after_an_aborted_trial_reopens_the_full_cooldown():
+    """#14 follow-up: a caller that died between check() and record_* hands
+    the probe back via release_probe() -- the pair returns to OPEN with a
+    fresh full cooldown, so the abort cannot be ridden as a free trial."""
+    clock = _Clock()
+    breaker = _breaker(clock)
+    for _ in range(3):
+        breaker.record_flood(OP, PHONE)
+    clock.advance(301.0)
+    breaker.check(OP, PHONE)  # trial claimed, then its caller aborts
+
+    breaker.release_probe(OP, PHONE)
+    with pytest.raises(TelegramOperationSuspendedError) as exc:
+        breaker.check(OP, PHONE)
+    assert exc.value.retry_after_sec == pytest.approx(300.0)
+    assert breaker.peek(OP, PHONE) == pytest.approx(300.0)
+
+

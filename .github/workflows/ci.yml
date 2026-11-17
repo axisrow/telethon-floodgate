@@ -36,3 +36,18 @@ jobs:
         run: pip install -e ".[dev]"
       - name: Pytest
         run: python -m pytest -q
+
+  telethon-contract:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        telethon: ["1.36.0", "1.43.2", "1.45.0"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install supported Telethon
+        run: pip install -e ".[dev]" "Telethon==${{ matrix.telethon }}"
+      - name: Offline sender-boundary contracts
+        run: python -m pytest tests/test_rpc_gate.py -q

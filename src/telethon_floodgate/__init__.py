@@ -63,6 +63,7 @@ from telethon_floodgate.rate_limiter import (
 from telethon_floodgate.rpc_gate import (
     DEFAULT_RPC_OPERATIONS,
     RpcDispatchAdmission,
+    RpcDispatchBudget,
     RpcDispatchDecision,
     RpcDispatchGate,
     RpcDispatchPolicy,
@@ -71,7 +72,7 @@ from telethon_floodgate.rpc_gate import (
 )
 from telethon_floodgate.token_bucket import TokenBucket
 
-__version__ = "0.1.9"
+__version__ = "0.1.10"
 
 __all__ = [
     "DEFAULT_COOLDOWN_SECONDS",
@@ -88,6 +89,7 @@ __all__ = [
     "ResolveRateLimiter",
     "RateLimitSpec",
     "RpcDispatchAdmission",
+    "RpcDispatchBudget",
     "RpcDispatchDecision",
     "RpcDispatchGate",
     "RpcDispatchPolicy",
