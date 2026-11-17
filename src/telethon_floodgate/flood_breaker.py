@@ -204,10 +204,15 @@ class FloodCircuitBreaker:
 
     def release_probe(self, operation: str, phone: str | None) -> None:
         """Release an aborted/non-flood probe without erasing flood evidence."""
+        if not phone:
+            return
         key = (operation, phone)
         if self._probe_in_flight.pop(key, None) is not None:
             self._states[key] = _OPEN
-            self._open_until[key] = self._time()
+            # Full fresh cooldown, not a deadline at `now`: an already-expired
+            # deadline would hand the very next caller an immediate trial, so
+            # an abort loop would never actually back off (#14 follow-up).
+            self._open_until[key] = self._time() + self._cooldown_seconds
 
     def record_flood(self, operation: str, phone: str | None) -> None:
         """Count a flood wait against this (operation, phone)."""

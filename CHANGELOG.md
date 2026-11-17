@@ -22,6 +22,10 @@
 - Add non-claiming breaker `peek` and `release_probe`, aggregate gate
   `peek_batch`/`commit_batch`, and optional RPC/source/delivery fields on
   `FloodWaitInfo`. Existing limiter entry points remain compatible.
+- `release_probe` re-arms a released trial on a full fresh cooldown: an
+  already-expired deadline handed the very next caller an immediate trial,
+  so an abort loop never actually backed off. Pinned by new breaker tests
+  covering `peek` OPEN/half-open/live-probe and `release_probe` semantics.
 
 
 ## 0.1.9 (2026-11-17)
