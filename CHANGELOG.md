@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.10 (unreleased)
+## 0.1.10 (2026-11-17)
 
 - Optional `gate_wait_max_sec` paces short category/peer deferrals before
   dispatch, preserving multi-prompt native conversation flows; default
