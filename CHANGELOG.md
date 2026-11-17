@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- CI: cache pip downloads across runs and install only the pytest stack in
+  the test/contract jobs (`.[dev]` stays for lint). Same checks, shorter
+  jobs — the Install step was ~2/3 of each job's wall time.
+
 ## 0.1.10 (2026-11-17)
 
 - Optional `gate_wait_max_sec` paces short category/peer deferrals before
