@@ -1,8 +1,11 @@
 """Unit tests for the per-account resolve_username rate limiter (#551)."""
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
+from telethon_floodgate import rate_limiter
 from telethon_floodgate.rate_limiter import ResolveRateLimiter
 
 
@@ -465,6 +468,47 @@ def test_restore_decays_already_elapsed_tightening():
     })
     # expires_in 0 means the tightening already burnt out in wall-clock terms.
     assert limiter._effective_sustained_cap("+1", 1000.0) == 60
+
+
+def _tightened_snapshot(monkeypatch, wall: list[float]) -> dict:
+    """A limiter tightened for 4 h at wall time ``wall[0]``, snapshotted at once."""
+    monkeypatch.setattr(rate_limiter, "time", SimpleNamespace(time=lambda: wall[0]))
+    limiter = _default_limiter(_FakeClock())
+    assert limiter.try_acquire("+1") == 0.0
+    assert limiter.tighten("+1", duration_sec=4 * 3600.0) == 30
+    return limiter.snapshot_state()
+
+
+def test_restore_counts_the_downtime_against_a_tightening(monkeypatch):
+    """#38: a budget tightened for 4 h ends 4 h after the flood, not 4 h after
+    the restart. The snapshot carried only the seconds left and the restore
+    started that countdown over, so the whole downtime was added."""
+    wall = [50_000.0]
+    snapshot = _tightened_snapshot(monkeypatch, wall)
+
+    wall[0] += 3600.0  # the restart took an hour
+    clock = _FakeClock()
+    revived = _default_limiter(clock)
+    revived.restore_state(snapshot)
+
+    # 3 of the 4 hours were left, not 4.
+    assert revived._effective_sustained_cap("+1", clock.now + 3 * 3600.0 - 1.0) == 30
+    assert revived._effective_sustained_cap("+1", clock.now + 3 * 3600.0) == 60
+
+
+def test_restore_never_lengthens_a_tightening(monkeypatch):
+    """A wall clock that stepped back between snapshot and restore (NTP, another
+    host) must not stretch the tightening past the seconds left at snapshot time."""
+    wall = [50_000.0]
+    snapshot = _tightened_snapshot(monkeypatch, wall)
+
+    wall[0] -= 3600.0
+    clock = _FakeClock()
+    revived = _default_limiter(clock)
+    revived.restore_state(snapshot)
+
+    assert revived._effective_sustained_cap("+1", clock.now + 4 * 3600.0 - 1.0) == 30
+    assert revived._effective_sustained_cap("+1", clock.now + 4 * 3600.0) == 60
 
 
 def test_restore_into_live_window_stays_sorted_and_pruned():

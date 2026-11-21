@@ -345,7 +345,8 @@ class ResolveRateLimiter:
         monotonic stamps die with the process, but ``restore_state`` replays
         wall-clock stamps against the next boot's clock, so sustained volume
         stays honest across a daemon restart (#26). Tightened budgets travel
-        too, as remaining seconds.
+        too: the seconds left plus the wall-clock deadline, so the next boot
+        counts its downtime against them (#38).
         """
         now_mono = self._time()
         now_wall = time.time()
@@ -362,9 +363,11 @@ class ResolveRateLimiter:
                 entry["sustained"] = [now_wall - (now_mono - t) for t in sustained]
             tight = self._tightened.get(phone)
             if tight is not None:
+                expires_in = max(0.0, tight[1] - now_mono)
                 entry["tightened"] = {
                     "cap": tight[0],
-                    "expires_in": max(0.0, tight[1] - now_mono),
+                    "expires_in": expires_in,
+                    "expires_at": now_wall + expires_in,
                 }
             snapshot[phone] = entry
         return snapshot
@@ -404,8 +407,10 @@ class ResolveRateLimiter:
         entries older than their window are dropped, and the merge into
         existing state is kept sorted (see :meth:`_merge_stamps` — both the
         prune and the retry math need ascending stamps). Tightened budgets
-        whose duration already elapsed in wall-clock terms decay the same
-        way. Merges into existing state.
+        decay the same way: the time between snapshot and restore counts
+        against them (#38). A snapshot without the wall-clock deadline
+        (0.1.10 and older) replays its remaining seconds. Merges into
+        existing state.
         """
         now_mono = self._time()
         now_wall = time.time()
@@ -432,8 +437,13 @@ class ResolveRateLimiter:
                 )
             tight = entry.get("tightened")
             if tight is not None and self._sustained_calls is not None:
-                cap, expires_in = tight["cap"], tight["expires_in"]
-                self._tightened[phone] = (int(cap), now_mono + max(0.0, float(expires_in)))
+                cap, remaining = tight["cap"], float(tight["expires_in"])
+                expires_at = tight.get("expires_at")
+                if expires_at is not None:
+                    # #38: the downtime counts, and a wall clock that stepped
+                    # back never stretches the tightening past the seconds left.
+                    remaining = min(remaining, float(expires_at) - now_wall)
+                self._tightened[phone] = (int(cap), now_mono + max(0.0, remaining))
 
     def used(self, phone: str) -> int:
         """Burst-window calls recorded for ``phone`` (prunes first).
