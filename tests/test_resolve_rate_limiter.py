@@ -431,6 +431,7 @@ def test_snapshot_restore_keeps_volume_across_replacement():
     assert revived.try_acquire("+1") == 0.0
     assert revived.try_acquire("+1") > 0.0
     # 40 carried + the fresh allowed call = 41 in the sustained window.
+    assert revived._sustained_calls is not None
     assert len(revived._sustained_calls["+1"]) == 41
 
 
