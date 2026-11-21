@@ -5,6 +5,15 @@
 - CI: cache pip downloads across runs and install only the pytest stack in
   the test/contract jobs (`.[dev]` stays for lint). Same checks, shorter
   jobs — the Install step was ~2/3 of each job's wall time.
+- `ResolveRateLimiter.restore_state` counts the downtime against a
+  tightened budget (#38). The snapshot carried only the seconds left and
+  the restore started that countdown over, so every restart during a
+  `tighten` stretched it by the whole downtime (4 h plus a 1 h restart
+  lasted 5 h), contrary to the docstring. `snapshot_state` now also stores
+  the wall-clock deadline (`expires_at`); the restore keeps only the
+  seconds still left, never more than the snapshot had, so a wall clock
+  that stepped back cannot stretch it either. Snapshots without
+  `expires_at` replay as before; older versions ignore the extra key.
 
 ## 0.1.10 (2026-11-17)
 
