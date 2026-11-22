@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.11 (2026-11-22)
 
 - CI: cache pip downloads across runs and install only the pytest stack in
   the test/contract jobs (`.[dev]` stays for lint). Same checks, shorter

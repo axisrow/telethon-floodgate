@@ -72,7 +72,7 @@ from telethon_floodgate.rpc_gate import (
 )
 from telethon_floodgate.token_bucket import TokenBucket
 
-__version__ = "0.1.10"
+__version__ = "0.1.11"
 
 __all__ = [
     "DEFAULT_COOLDOWN_SECONDS",
