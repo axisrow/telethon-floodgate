@@ -16,6 +16,7 @@ content collector:
 Telegram publishes no quotas; the bundled defaults are calibrated against
 observed production behaviour and are configurable.
 """
+from telethon_floodgate._errors import TelegramRateLimitedError
 from telethon_floodgate.flood_breaker import (
     DEFAULT_COOLDOWN_SECONDS,
     DEFAULT_FLOOD_THRESHOLD,
@@ -49,7 +50,6 @@ from telethon_floodgate.peer import (
 from telethon_floodgate.rate_limit_gate import (
     RateLimitSpec,
     TelegramPeerRateLimitedError,
-    TelegramRateLimitedError,
     TelegramRateLimitGate,
     TelegramUnregisteredOperationError,
 )
