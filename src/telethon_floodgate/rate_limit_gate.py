@@ -141,6 +141,15 @@ _OPERATION_CATEGORIES = {
     "rpc_resolve": "resolve",
     "rpc_upload": "default",
     "rpc_download": "default",
+    # The dispatch boundary's dynamic fallback tag for the forum-topics
+    # listing read (messages.GetForumTopicsRequest, #40): the guard knows it
+    # as read-only, but without a category here it degraded into the
+    # permissive default bucket with an unregistered-operation warning
+    # (tg_content_factory#1928). Same quota class as the #1805 passthroughs —
+    # a paginated read, charged like history. The by-ID sibling
+    # (rpc:GetForumTopicsByIDRequest, a t.me link resolution) stays on the
+    # warn-once default until a consumer shows real volume.
+    "rpc:GetForumTopicsRequest": "history",
 }
 
 

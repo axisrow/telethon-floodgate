@@ -10,6 +10,7 @@ themselves would prove nothing about nested-RPC coverage.
 import asyncio
 import datetime
 import inspect
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -29,8 +30,18 @@ from telethon_floodgate import (
     attach_rpc_gate,
     run_with_flood_wait,
 )
+from telethon_floodgate.rate_limit_gate import _WARNED_UNKNOWN_OPERATIONS
 
 PHONE = "+15550001"
+
+# Telethon moved the forum-topics RPC between namespaces across the supported
+# matrix pins: channels.GetForumTopicsRequest in 1.36.0, messages.* since
+# 1.43.2. The class name — and with it the boundary's dynamic ``rpc:<Name>``
+# tag under test (#40) — is identical, so the gate contract is version-free.
+_GetForumTopicsRequest = (
+    getattr(functions.messages, "GetForumTopicsRequest", None)
+    or functions.channels.GetForumTopicsRequest
+)
 
 
 class RecordingSender:
@@ -317,6 +328,38 @@ async def test_unknown_rpc_lands_in_default():
     assert decisions[0].rpc == "GetNearestDcRequest"
     assert decisions[0].operation == "rpc:GetNearestDcRequest"
     assert decisions[0].category == "default"
+    handle.detach()
+
+
+async def test_forum_topics_read_charges_history_without_warning(caplog):
+    """The forum-topics listing read (messages.GetForumTopicsRequest — the
+    `dialogs topics` call of tg_content_factory#1928) used to fall through to
+    the permissive default bucket with an unregistered-operation warning
+    (#40): the guard already knew it as read-only, but the gate had no
+    category for its dynamic ``rpc:<Name>`` tag. It must charge the
+    calibrated history read bucket instead and stay silent."""
+    client, recorder = make_client()
+    recorder.respond(_GetForumTopicsRequest, True)
+    gate = TelegramRateLimitGate()
+    decisions: list = []
+    handle = attach_rpc_gate(client, gate, PHONE, on_decision=decisions.append)
+    _WARNED_UNKNOWN_OPERATIONS.clear()
+
+    with caplog.at_level(logging.WARNING, logger="telethon_floodgate.rate_limit_gate"):
+        # Dispatch through the patched sender.send — the exact boundary the
+        # gate wraps. client.__call__ would first resolve the request's peer/
+        # channel argument, and the 1.36 channels.* variant resolves it
+        # unconditionally, dragging entity lookup into a pure boundary test.
+        await client._sender.send(_GetForumTopicsRequest(types.InputPeerEmpty(), None, 0, 0, 1))
+
+    assert recorder.dispatches  # admitted and dispatched, not refused
+    assert decisions[0].rpc == "GetForumTopicsRequest"
+    assert decisions[0].operation == "rpc:GetForumTopicsRequest"  # the tag consumers grep for
+    assert decisions[0].category == "history"
+    assert decisions[0].read_only is True  # the guard's read-only recognition is untouched
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+    assert gate.snapshot(PHONE)["categories"]["history"]["used"] >= 1
+    assert gate.snapshot(PHONE)["categories"]["default"]["used"] == 0
     handle.detach()
 
 
