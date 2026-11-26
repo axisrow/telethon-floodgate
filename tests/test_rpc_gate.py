@@ -34,6 +34,15 @@ from telethon_floodgate.rate_limit_gate import _WARNED_UNKNOWN_OPERATIONS
 
 PHONE = "+15550001"
 
+# Telethon moved the forum-topics RPC between namespaces across the supported
+# matrix pins: channels.GetForumTopicsRequest in 1.36.0, messages.* since
+# 1.43.2. The class name — and with it the boundary's dynamic ``rpc:<Name>``
+# tag under test (#40) — is identical, so the gate contract is version-free.
+_GetForumTopicsRequest = (
+    getattr(functions.messages, "GetForumTopicsRequest", None)
+    or functions.channels.GetForumTopicsRequest
+)
+
 
 class RecordingSender:
     """Stands in for MTProtoSender.send; deterministic TL responses by type."""
@@ -330,19 +339,18 @@ async def test_forum_topics_read_charges_history_without_warning(caplog):
     category for its dynamic ``rpc:<Name>`` tag. It must charge the
     calibrated history read bucket instead and stay silent."""
     client, recorder = make_client()
-    recorder.respond(
-        functions.messages.GetForumTopicsRequest,
-        types.messages.ForumTopics(count=0, topics=[], messages=[], chats=[], users=[], pts=0),
-    )
+    recorder.respond(_GetForumTopicsRequest, True)
     gate = TelegramRateLimitGate()
     decisions: list = []
     handle = attach_rpc_gate(client, gate, PHONE, on_decision=decisions.append)
     _WARNED_UNKNOWN_OPERATIONS.clear()
 
     with caplog.at_level(logging.WARNING, logger="telethon_floodgate.rate_limit_gate"):
-        await client(functions.messages.GetForumTopicsRequest(
-            peer=types.InputPeerEmpty(), offset_date=None, offset_id=0, offset_topic=0, limit=1,
-        ))
+        # Dispatch through the patched sender.send — the exact boundary the
+        # gate wraps. client.__call__ would first resolve the request's peer/
+        # channel argument, and the 1.36 channels.* variant resolves it
+        # unconditionally, dragging entity lookup into a pure boundary test.
+        await client._sender.send(_GetForumTopicsRequest(types.InputPeerEmpty(), None, 0, 0, 1))
 
     assert recorder.dispatches  # admitted and dispatched, not refused
     assert decisions[0].rpc == "GetForumTopicsRequest"
