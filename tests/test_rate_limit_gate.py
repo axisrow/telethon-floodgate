@@ -157,7 +157,27 @@ def test_registered_and_suffix_rescued_tags_never_warn(caplog) -> None:
         assert _category_for_operation("telegram_edit_admin") == "admin_action"
         assert _category_for_operation("leave_channels:123_warm_dialog_cache") == "dialogs"
         assert _category_for_operation("resume_stream_dialogs") == "dialog_sweep"
+        # the dynamic rpc:<Name> fallback tag for the forum-topics listing
+        # read is registered too (#40) — silence proves it (#40 regression).
+        assert _category_for_operation("rpc:GetForumTopicsRequest") == "history"
     assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+@pytest.mark.parametrize(
+    ("operation", "category"),
+    (("rpc:GetForumTopicsRequest", "history"),),
+)
+def test_dynamic_rpc_read_tag_is_registered(operation: str, category: str) -> None:
+    """The dispatch boundary builds ``rpc:<ClassName>`` tags for RPCs its
+    policy map does not name. The forum-topics listing read
+    (messages.GetForumTopicsRequest, tg_content_factory#1928) hit that
+    fallback and degraded into the permissive default bucket with a warning
+    (#40). It must resolve deliberately, into the same calibrated read quota
+    class as the #1805 passthroughs — a real configured bucket, not the
+    warn-once default."""
+    assert _category_for_operation(operation) == category
+    gate = TelegramRateLimitGate()
+    assert category in gate.snapshot("+15551230001")["categories"]
 
 
 # --- strict_categories: fail closed on unregistered tags (#29) ---------------

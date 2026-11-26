@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Register the RPC dispatch boundary's dynamic tag for the forum-topics
+  listing read (`rpc:GetForumTopicsRequest`, issue #40) in the calibrated
+  `history` bucket. It fell through to the permissive `default` category
+  with an unregistered-operation warning (`dialogs topics` in
+  tg_content_factory, #1928) although the guard already classified it
+  read-only. Unknown operations keep the warn-once permissive default.
+
 ## 0.1.11 (2026-11-22)
 
 - CI: cache pip downloads across runs and install only the pytest stack in
