@@ -271,7 +271,13 @@ class TelegramRateLimitGate:
     # messages.getHistory empirical boundary: 30 requests in roughly 30s on
     # the calibrated account/channel (31st request returned FLOOD_WAIT_3).
     # Keep a 20% margin; Telegram does not publish this quota.
-    HISTORY_SPEC = RateLimitSpec(max_calls=24, window_sec=30.0)
+    # No sustained hour (tg_content_factory#1991): the tier every bucket takes
+    # from the limiter is the username-resolve calibration, and at this pace it
+    # is one minute of reads and 59 minutes of refusal per account. The burst
+    # is the measured guard; the deep floods on record were resolves.
+    HISTORY_SPEC = RateLimitSpec(
+        max_calls=24, window_sec=30.0, sustained_max_calls=None, sustained_window_sec=None
+    )
     ADMIN_ACTION_SPEC = RateLimitSpec(max_calls=10, window_sec=60.0)
     SEND_SPEC = RateLimitSpec(max_calls=30, window_sec=60.0)
     CHANNEL_LIFECYCLE_SPEC = RateLimitSpec(max_calls=3, window_sec=300.0)

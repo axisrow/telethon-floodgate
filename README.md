@@ -58,6 +58,10 @@ own pair; both `None` turns the tier off for that bucket:
 RateLimitSpec(max_calls=24, window_sec=30.0, sustained_max_calls=None, sustained_window_sec=None)
 ```
 
+`history` does exactly that: its burst is the measured guard, and the
+sustained hour — never calibrated for reads — capped a consumer's collection
+at one fetch a minute per account (tg_content_factory#1991).
+
 An operation tag that is not registered resolves to the permissive `default`
 bucket with a warn-once log. Integrations that register their tags can fail
 closed instead: `TelegramRateLimitGate(strict_categories=True)` raises
@@ -292,7 +296,7 @@ configurable.
 
 | Category | Configured guardrail | Evidence |
 | --- | --- | --- |
-| `history` (`messages.getHistory`) | 24 requests / 30s | A live probe reached FLOOD_WAIT on request 31 after 30 requests; the page size (1 vs 100) did not change the request threshold. Independent empirical notes report about 30 requests / 30s ([copy-history-bot-2](https://github.com/code29563/copy-history-bot-2#switching-between-clients-and-handling-floodwaits)). |
+| `history` (`messages.getHistory`) | 24 requests / 30s | A live probe reached FLOOD_WAIT on request 31 after 30 requests; the page size (1 vs 100) did not change the request threshold. Independent empirical notes report about 30 requests / 30s ([copy-history-bot-2](https://github.com/code29563/copy-history-bot-2#switching-between-clients-and-handling-floodwaits)). No sustained hour: the inherited 60-an-hour tier left one minute of reads and 59 of refusal per account at this pace (tg_content_factory#1991). |
 | `send:user` | 1 / 1.1s | Community guidance is about one message per second to one private peer; the live Saved Messages test passed at about 1s, and the guardrail adds margin. |
 | `send:channel`, `send:chat` | 16 / 60s | Community guidance is about 20 messages per minute in one group/channel ([Telegram Limits](https://limits.tginfo.me/en)); the guardrail keeps a margin. |
 | account-wide `send` and other categories | Existing values | No repeatable public numeric quota was found for these method families; they remain internal conservative guardrails. |

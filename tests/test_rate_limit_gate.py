@@ -353,6 +353,26 @@ def test_history_uses_empirical_window_with_conservative_margin() -> None:
     assert gate.try_acquire("+1", "history") == 0.0
 
 
+def test_history_has_no_sustained_hour() -> None:
+    """The burst above is the calibrated guard of a history call; the hour is
+    not (tg_content_factory#1991).
+
+    Every bucket used to inherit the limiter's sustained tier — 60 calls an
+    hour, the username-resolve calibration of #26. At the calibrated pace that
+    is one minute of reads and 59 minutes of refusal per account: the
+    consumer's collector ran 246-248 fetches an hour for four accounts and
+    logged about 10,000 refusals an hour.
+    """
+    spec = TelegramRateLimitGate.HISTORY_SPEC
+    assert (spec.sustained_max_calls, spec.sustained_window_sec) == (None, None)
+    clock = _Clock()
+    gate = TelegramRateLimitGate(time_func=clock, jitter_func=_no_jitter)
+    for _ in range(75):  # the calibrated pace for seventy-five minutes
+        for _ in range(spec.max_calls):
+            assert gate.try_acquire("+1", "history") == 0.0
+        clock.now += spec.window_sec
+
+
 def test_compound_slot_reservation_is_atomic() -> None:
     clock = _Clock()
     gate = TelegramRateLimitGate(time_func=clock, jitter_func=_no_jitter)
