@@ -31,6 +31,7 @@ from telethon_floodgate import (
     run_with_flood_wait,
 )
 from telethon_floodgate.rate_limit_gate import _WARNED_UNKNOWN_OPERATIONS
+from telethon_floodgate.rpc_gate import DEFAULT_RPC_OPERATIONS
 
 PHONE = "+15550001"
 
@@ -313,6 +314,64 @@ async def test_upload_parts_do_not_consume_send_quota():
 
     assert len([d for d in decisions if d.operation == "rpc_upload"]) >= 2
     assert gate.snapshot(PHONE)["categories"]["send"]["used"] == 0
+    handle.detach()
+
+
+@pytest.mark.parametrize(
+    ("request_type", "operation"),
+    (
+        (functions.upload.SaveFilePartRequest, "rpc_upload"),
+        (functions.upload.SaveBigFilePartRequest, "rpc_upload"),
+        (functions.messages.UploadMediaRequest, "rpc_upload"),
+        (functions.upload.GetFileRequest, "rpc_download"),
+        (functions.upload.GetCdnFileRequest, "rpc_download"),
+        (functions.upload.GetCdnFileHashesRequest, "rpc_download"),
+        (functions.upload.GetFileHashesRequest, "rpc_download"),
+        (functions.upload.ReuploadCdnFileRequest, "rpc_download"),
+        (functions.upload.GetWebFileRequest, "rpc_download"),
+    ),
+)
+def test_every_transfer_rpc_has_a_row(request_type, operation):
+    """The whole transfer family is classified: a part, hash or re-upload RPC
+    without a row is priced in ``default`` with a warn-once line
+    (tg_content_factory#1985)."""
+    assert DEFAULT_RPC_OPERATIONS[request_type] == operation
+
+
+@pytest.mark.parametrize("strict", (False, True))
+async def test_upload_media_is_priced_as_upload(strict, caplog):
+    """messages.uploadMedia closes the upload of every media file — the second
+    RPC of a small photo after its saveFilePart. Unregistered, it fell into
+    ``default`` with a warn-once line on the first album, and strict mode
+    refused it outright (tg_content_factory#1985)."""
+    client, recorder = make_client()
+    install_defaults(recorder)
+    recorder.respond(
+        functions.messages.UploadMediaRequest,
+        types.MessageMediaPhoto(
+            photo=types.Photo(
+                id=1, access_hash=2, file_reference=b"\x00", date=None, dc_id=2, sizes=[]
+            )
+        ),
+    )
+    gate = TelegramRateLimitGate(strict_categories=strict)
+    decisions: list = []
+    handle = attach_rpc_gate(client, gate, PHONE, on_decision=decisions.append)
+
+    with caplog.at_level(logging.WARNING, logger="telethon_floodgate.rate_limit_gate"):
+        await client(
+            functions.messages.UploadMediaRequest(
+                peer=types.InputPeerSelf(),
+                media=types.InputMediaUploadedPhoto(
+                    file=types.InputFile(id=1, parts=1, name="a.png", md5_checksum="abc")
+                ),
+            )
+        )
+
+    upload = [d for d in decisions if d.rpc == "UploadMediaRequest"]
+    assert [(d.operation, d.category) for d in upload] == [("rpc_upload", "upload")]
+    assert not [d for d in decisions if d.category == "default"]
+    assert "not registered" not in caplog.text
     handle.detach()
 
 

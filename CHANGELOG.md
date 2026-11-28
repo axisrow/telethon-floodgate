@@ -8,6 +8,27 @@
   with an unregistered-operation warning (`dialogs topics` in
   tg_content_factory, #1928) although the guard already classified it
   read-only. Unknown operations keep the warn-once permissive default.
+- Transfers own two categories: `rpc_upload` → `upload`, `rpc_download` →
+  `download` (tg_content_factory#1985). They used to land in `default` on
+  purpose, but every bucket also carried the sustained tier that #26 made the
+  limiter's default — 60 calls an hour, the username-resolve calibration — so
+  an album's parts drained the very bucket that prices `users.getUsers` on the
+  connect path: the sixth small photo of an album was refused, and for minutes
+  the account could not connect at all. Both use `TRANSFER_SPEC`: 1000/60s
+  (the burst transfers always had) and 10000/3600s — not a calibration, no
+  transfer flood is on record; the hour admits one maximum-size legal upload
+  (8192 parts of 512 KB) with a margin, because a refusal mid-file is a failed
+  upload, not a slower one. Override with `category_limits`.
+- `RateLimitSpec` carries its own sustained tier: `sustained_max_calls` and
+  `sustained_window_sec`, defaulting to the limiter's values; both `None`
+  turns the tier off for that bucket. A category whose burst is not the
+  resolve calibration (for example `history`, 24/30s against 60 an hour) can
+  now say so. Existing categories are unchanged.
+- RPC boundary: `messages.UploadMediaRequest` and the CDN leg of a download
+  (`GetCdnFileHashesRequest`, `GetFileHashesRequest`, `ReuploadCdnFileRequest`,
+  `GetWebFileRequest`) are classified. `UploadMediaRequest` used to warn
+  `not registered` on the first album and failed closed under
+  `strict_categories`.
 
 ## 0.1.11 (2026-11-22)
 

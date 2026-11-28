@@ -53,8 +53,17 @@ DEFAULT_RPC_OPERATIONS: dict[object, str | None] = {
     tl_functions.contacts.ResolveUsernameRequest: "rpc_resolve",
     tl_functions.upload.SaveFilePartRequest: "rpc_upload",
     tl_functions.upload.SaveBigFilePartRequest: "rpc_upload",
+    # messages.uploadMedia closes every media upload after its parts
+    # (tg_content_factory#1985): unregistered, it fell into "default" with a
+    # warn-once line on the first album.
+    tl_functions.messages.UploadMediaRequest: "rpc_upload",
     tl_functions.upload.GetFileRequest: "rpc_download",
     tl_functions.upload.GetCdnFileRequest: "rpc_download",
+    # The CDN leg of a download: its hashes and the re-upload it may ask for.
+    tl_functions.upload.GetCdnFileHashesRequest: "rpc_download",
+    tl_functions.upload.GetFileHashesRequest: "rpc_download",
+    tl_functions.upload.ReuploadCdnFileRequest: "rpc_download",
+    tl_functions.upload.GetWebFileRequest: "rpc_download",
     tl_functions.messages.GetHistoryRequest: None,
     tl_functions.messages.SearchRequest: None,
     tl_functions.messages.SearchGlobalRequest: None,
