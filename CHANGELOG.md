@@ -23,12 +23,17 @@
   `sustained_window_sec`, defaulting to the limiter's values; both `None`
   turns the tier off for that bucket. A category whose burst is not the
   resolve calibration (for example `history`, 24/30s against 60 an hour) can
-  now say so. Existing categories are unchanged.
+  now say so. Existing categories are unchanged. Peer specs validate the
+  sustained pair — and the sustained window against the burst window —
+  eagerly at gate construction, like their burst window: the lazy peer
+  bucket must not surface a `ValueError` from inside `try_acquire`.
 - RPC boundary: `messages.UploadMediaRequest` and the CDN leg of a download
   (`GetCdnFileHashesRequest`, `GetFileHashesRequest`, `ReuploadCdnFileRequest`,
   `GetWebFileRequest`) are classified. `UploadMediaRequest` used to warn
   `not registered` on the first album and failed closed under
-  `strict_categories`.
+  `strict_categories`. `GetWebFileRequest` and `ReuploadCdnFileRequest` are
+  also listed in the guard's read-only names beside their download-leg
+  siblings, so admissions and `rpc_read_only` flags report True for them.
 
 ## 0.1.11 (2026-11-22)
 

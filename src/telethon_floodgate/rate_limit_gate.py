@@ -401,6 +401,22 @@ class TelegramRateLimitGate:
                 raise ValueError(
                     f"peer spec {key!r}: window_sec must be finite and > 0"
                 )
+            # Same contract for the sustained tier: peer buckets build their
+            # limiter lazily at request time, so a half-set pair or a
+            # sustained window below the burst window would surface the
+            # limiter's ValueError from inside try_acquire on the first
+            # acquire for that peer.
+            if (spec.sustained_max_calls is None) != (spec.sustained_window_sec is None):
+                raise ValueError(
+                    f"peer spec {key!r}: sustained_max_calls and sustained_window_sec must be set together"
+                )
+            if spec.sustained_window_sec is not None and not (
+                isfinite(spec.sustained_window_sec)
+                and spec.sustained_window_sec >= spec.window_sec
+            ):
+                raise ValueError(
+                    f"peer spec {key!r}: sustained_window_sec must be finite and >= window_sec"
+                )
         self._peer_max_buckets = max(1, int(peer_max_buckets))
         self._peer_buckets: OrderedDict[tuple[str, str, str], ResolveRateLimiter] = OrderedDict()
 

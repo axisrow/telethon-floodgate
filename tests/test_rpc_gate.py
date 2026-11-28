@@ -375,6 +375,35 @@ async def test_upload_media_is_priced_as_upload(strict, caplog):
     handle.detach()
 
 
+@pytest.mark.parametrize(
+    ("request_type", "rpc"),
+    (
+        (functions.upload.GetWebFileRequest, "GetWebFileRequest"),
+        (functions.upload.ReuploadCdnFileRequest, "ReuploadCdnFileRequest"),
+    ),
+)
+async def test_cdn_leg_reads_are_recognized_read_only(request_type, rpc):
+    """The web-file and re-upload legs of a download are plainly read-only:
+    the guard must list them in _READ_ONLY_NAMES beside their siblings, or
+    admissions and rpc_read_only exception flags report False for them."""
+    client, recorder = make_client()
+    recorder.respond(request_type, True)
+    gate = TelegramRateLimitGate()
+    decisions: list = []
+    handle = attach_rpc_gate(client, gate, PHONE, on_decision=decisions.append)
+
+    if rpc == "GetWebFileRequest":
+        request = request_type(types.InputWebFileLocation(url="https://example.com/a", access_hash=1), 0, 524288)
+    else:
+        request = request_type(b"file-token", b"encryption-key")
+    await client(request)
+
+    assert decisions[0].rpc == rpc
+    assert decisions[0].category == "download"
+    assert decisions[0].read_only is True
+    handle.detach()
+
+
 async def test_unknown_rpc_lands_in_default():
     client, recorder = make_client()
     recorder.respond(functions.help.GetNearestDcRequest, True)

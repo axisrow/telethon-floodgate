@@ -922,3 +922,32 @@ def test_peer_specs_validate_window_at_construction() -> None:
         TelegramRateLimitGate(
             peer_limits={"send:user": RateLimitSpec(max_calls=1, window_sec=0.0)}
         )
+
+
+@pytest.mark.parametrize(
+    "sustained_kwargs",
+    ({"sustained_max_calls": None}, {"sustained_window_sec": None}),
+)
+def test_peer_specs_validate_sustained_pair_at_construction(sustained_kwargs: dict) -> None:
+    """A peer spec with a half-set sustained tier must fail at gate
+    construction: the peer bucket builds its limiter lazily at request time,
+    so the pair would otherwise surface the limiter's ValueError from inside
+    try_acquire on the first acquire for that peer."""
+    with pytest.raises(ValueError, match="together"):
+        TelegramRateLimitGate(
+            peer_limits={"send:user": RateLimitSpec(1, 1.1, **sustained_kwargs)}
+        )
+
+
+def test_peer_specs_validate_sustained_window_at_construction() -> None:
+    """A sustained window below the burst window must fail at gate
+    construction: ResolveRateLimiter rejects that ordering, and the peer
+    bucket's limiter is built inside try_acquire, which must never raise."""
+    with pytest.raises(ValueError, match="send:user"):
+        TelegramRateLimitGate(
+            peer_limits={
+                "send:user": RateLimitSpec(
+                    max_calls=1, window_sec=60.0, sustained_max_calls=10, sustained_window_sec=30.0
+                )
+            }
+        )

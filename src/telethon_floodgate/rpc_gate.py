@@ -101,7 +101,8 @@ _READ_ONLY_NAMES = frozenset({
     "GetUsersRequest", "GetChannelsRequest", "GetChatsRequest", "GetMessageReactionsListRequest",
     "GetFullChannelRequest", "GetFullChatRequest", "GetFullUserRequest",
     "GetForumTopicsRequest", "GetForumTopicsByIDRequest", "GetFileRequest", "GetCdnFileRequest",
-    "GetCdnFileHashesRequest", "GetFileHashesRequest", "GetStateRequest", "GetDifferenceRequest",
+    "GetCdnFileHashesRequest", "GetFileHashesRequest", "GetWebFileRequest",
+    "ReuploadCdnFileRequest", "GetStateRequest", "GetDifferenceRequest",
     "GetChannelDifferenceRequest", "GetAllDraftsRequest", "GetSavedGifsRequest", "GetInlineBotResultsRequest",
 })
 
