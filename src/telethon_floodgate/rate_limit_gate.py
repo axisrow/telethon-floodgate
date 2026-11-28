@@ -22,7 +22,11 @@ from telethon.tl.functions import channels, messages
 
 from telethon_floodgate._errors import TelegramRateLimitedError
 from telethon_floodgate.flood_wait import TRANSIENT_FLOOD_WAIT_MAX_SEC
-from telethon_floodgate.rate_limiter import ResolveRateLimiter
+from telethon_floodgate.rate_limiter import (
+    DEFAULT_SUSTAINED_MAX_CALLS,
+    DEFAULT_SUSTAINED_WINDOW_SEC,
+    ResolveRateLimiter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +64,14 @@ class RateLimitSpec:
     # anti-lockstep default spreads retries so accounts unblocking at the
     # same instant do not re-burst in lockstep. 0.0 disables explicitly.
     jitter_sec: float | None = None
+    # The sustained tier of this bucket: the wider second window of
+    # ``ResolveRateLimiter`` (#26). The defaults are the limiter's own — the
+    # username-resolve calibration of 60 calls an hour, which every category
+    # used to inherit silently. A category whose burst says otherwise carries
+    # its own pair here; both None turns the tier off for that bucket. The
+    # pair must be set together (the limiter validates).
+    sustained_max_calls: int | None = DEFAULT_SUSTAINED_MAX_CALLS
+    sustained_window_sec: float | None = DEFAULT_SUSTAINED_WINDOW_SEC
 
 
 def _effective_jitter(spec: RateLimitSpec) -> float:
@@ -129,9 +141,11 @@ _OPERATION_CATEGORIES = {
     "telegram_invoke_request": "history",
     # RPC dispatch-boundary tags (issue #34, rpc_gate.py): the boundary
     # classifies by the actual TL RPC, not the outer operation tag. Transfers
-    # land in "default" on purpose — upload/download traffic must not eat the
-    # calibrated send/history quotas; consumers with real transfer volume
-    # should register a dedicated category via category_limits.
+    # must not eat the calibrated send/history quotas, so they own "upload" and
+    # "download" (TRANSFER_SPEC). They used to land in "default" on purpose —
+    # but "default" carries the sustained tier too, and sharing it priced an
+    # album's parts against the very bucket of users.getUsers on the connect
+    # path (tg_content_factory#1985).
     "rpc_send": "send",
     "rpc_dialogs_page": "dialogs_page",
     "rpc_default": "default",
@@ -139,8 +153,8 @@ _OPERATION_CATEGORIES = {
     "rpc_channel_lifecycle": "channel_lifecycle",
     "rpc_admin_action": "admin_action",
     "rpc_resolve": "resolve",
-    "rpc_upload": "default",
-    "rpc_download": "default",
+    "rpc_upload": "upload",
+    "rpc_download": "download",
     # The dispatch boundary's dynamic fallback tag for the forum-topics
     # listing read (messages.GetForumTopicsRequest, #40): the guard knows it
     # as read-only, but without a category here it degraded into the
@@ -274,6 +288,17 @@ class TelegramRateLimitGate:
     SEND_PEER_USER_SPEC = RateLimitSpec(max_calls=1, window_sec=1.1, jitter_sec=0.15)
     SEND_PEER_CHANNEL_SPEC = RateLimitSpec(max_calls=16, window_sec=60.0)
     SEND_PEER_CHAT_SPEC = RateLimitSpec(max_calls=16, window_sec=60.0)
+    # Transfers are priced per RPC part (saveFilePart, uploadMedia, getFile):
+    # Telethon cuts a file into 128-512 KB parts, so an album of phone photos
+    # is hundreds of calls and one maximum-size file is up to 8192. The burst
+    # is the one transfers always had in "default". The sustained hour is not
+    # the resolve calibration: it admits one maximum-size legal upload (4 GB in
+    # 512 KB parts) with a ~20% margin, because the tier refusing mid-file is
+    # a failed upload, not a slower one. No transfer flood is on record, so
+    # this is a guardrail against a runaway loop, not a Telegram quota.
+    TRANSFER_SPEC = RateLimitSpec(
+        max_calls=1000, window_sec=60.0, sustained_max_calls=10_000, sustained_window_sec=3600.0
+    )
 
     def __init__(
         self,
@@ -304,6 +329,8 @@ class TelegramRateLimitGate:
             "send": self.SEND_SPEC,
             "channel_lifecycle": self.CHANNEL_LIFECYCLE_SPEC,
             "default": self.DEFAULT_SPEC,
+            "upload": self.TRANSFER_SPEC,
+            "download": self.TRANSFER_SPEC,
         }
         specs.update(category_limits or {})
         # Resolve None-jitter to the window-derived default once, so limiter
@@ -324,6 +351,8 @@ class TelegramRateLimitGate:
                 max_calls=spec.max_calls,
                 window_sec=spec.window_sec,
                 jitter_sec=_effective_jitter(spec),
+                sustained_max_calls=spec.sustained_max_calls,
+                sustained_window_sec=spec.sustained_window_sec,
                 time_func=self._time_func,
                 **({"jitter_func": jitter_func} if jitter_func is not None else {}),
             )
@@ -371,6 +400,22 @@ class TelegramRateLimitGate:
                 # never-raises contract.
                 raise ValueError(
                     f"peer spec {key!r}: window_sec must be finite and > 0"
+                )
+            # Same contract for the sustained tier: peer buckets build their
+            # limiter lazily at request time, so a half-set pair or a
+            # sustained window below the burst window would surface the
+            # limiter's ValueError from inside try_acquire on the first
+            # acquire for that peer.
+            if (spec.sustained_max_calls is None) != (spec.sustained_window_sec is None):
+                raise ValueError(
+                    f"peer spec {key!r}: sustained_max_calls and sustained_window_sec must be set together"
+                )
+            if spec.sustained_window_sec is not None and not (
+                isfinite(spec.sustained_window_sec)
+                and spec.sustained_window_sec >= spec.window_sec
+            ):
+                raise ValueError(
+                    f"peer spec {key!r}: sustained_window_sec must be finite and >= window_sec"
                 )
         self._peer_max_buckets = max(1, int(peer_max_buckets))
         self._peer_buckets: OrderedDict[tuple[str, str, str], ResolveRateLimiter] = OrderedDict()
@@ -648,6 +693,8 @@ class TelegramRateLimitGate:
                 max_calls=spec.max_calls,
                 window_sec=spec.window_sec,
                 jitter_sec=_effective_jitter(spec),
+                sustained_max_calls=spec.sustained_max_calls,
+                sustained_window_sec=spec.sustained_window_sec,
                 time_func=self._time_func,
                 **(
                     {"jitter_func": self._jitter_func}

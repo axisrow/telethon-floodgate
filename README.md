@@ -38,8 +38,9 @@ def before_telegram_call(phone: str, operation: str) -> None:
 
 Buckets are independent sliding windows keyed by `(phone, category)`:
 `dialogs` (1/min — the #1330 incident), `dialog_sweep`, `history`,
-`admin_action`, `send` (30/min), `channel_lifecycle` (3 per 5 min), plus a
-permissive `default`. Override any of them:
+`admin_action`, `send` (30/min), `channel_lifecycle` (3 per 5 min), `upload`
+and `download` (one call per RPC part), plus a `default` for everything
+unclassified. Override any of them:
 
 ```python
 from telethon_floodgate import RateLimitSpec, TelegramRateLimitGate
@@ -47,6 +48,14 @@ from telethon_floodgate import RateLimitSpec, TelegramRateLimitGate
 gate = TelegramRateLimitGate(
     category_limits={"send": RateLimitSpec(max_calls=10, window_sec=60.0)}
 )
+```
+
+Every bucket also carries the sustained tier of `ResolveRateLimiter` — 60
+calls an hour by default, the username-resolve calibration. A spec sets its
+own pair; both `None` turns the tier off for that bucket:
+
+```python
+RateLimitSpec(max_calls=24, window_sec=30.0, sustained_max_calls=None, sustained_window_sec=None)
 ```
 
 An operation tag that is not registered resolves to the permissive `default`
@@ -224,7 +233,8 @@ means no category charge, not an exemption from consumer checks. Only known
 protocol leaf requests (keepalives, connection configuration and authorization
 transfer) bypass application budgets. Message page defaults leave logical
 history accounting to the consumer/`wrap_messages_iterator`; dialogs pages
-have their existing separate page bucket. Transfers use default, not send.
+have their existing separate page bucket. Transfers use their own `upload` and
+`download` buckets, not send or default.
 
 Budgets default to `mode="defer"`. A process ceiling may opt into `mode="wait"`:
 the guard returns proxy Futures, waits without blocking the event loop, then
@@ -286,6 +296,7 @@ configurable.
 | `send:user` | 1 / 1.1s | Community guidance is about one message per second to one private peer; the live Saved Messages test passed at about 1s, and the guardrail adds margin. |
 | `send:channel`, `send:chat` | 16 / 60s | Community guidance is about 20 messages per minute in one group/channel ([Telegram Limits](https://limits.tginfo.me/en)); the guardrail keeps a margin. |
 | account-wide `send` and other categories | Existing values | No repeatable public numeric quota was found for these method families; they remain internal conservative guardrails. |
+| `upload`, `download` (one call per RPC part) | 1000 / 60s and 10000 / hour | Not calibrated against a flood: no transfer flood is on record. Telethon cuts a file into 128–512 KB parts, so one maximum-size legal upload is up to 8192 calls; the sustained hour admits one with a margin. Priced in `default` instead, the sixth small photo of an album was refused on a half-spent hour and the same bucket locked the account's connect path (tg_content_factory#1985). |
 
 The history value limits each actual `GetHistoryRequest`. A consumer must
 call the gate for every page request, not once for an entire logical export.

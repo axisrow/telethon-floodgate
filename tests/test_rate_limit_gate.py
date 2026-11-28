@@ -117,6 +117,98 @@ def test_transport_adapter_tags_are_registered(operation: str, category: str) ->
     assert category in gate.snapshot("+15551230001")["categories"]
 
 
+# --- transfer categories (tg_content_factory#1985) ----------------------------
+
+
+@pytest.mark.parametrize(("operation", "category"), (("rpc_upload", "upload"), ("rpc_download", "download")))
+def test_transfer_tags_own_a_configured_category(operation: str, category: str) -> None:
+    """Transfers used to be priced in ``default`` on purpose ("must not eat the
+    calibrated send/history quotas"). But every bucket also inherited the
+    resolve limiter's 60/h sustained tier (#26), so an album of small photos
+    drained the very bucket that prices the account's connect path
+    (tg_content_factory#1985). Uploads and downloads own a bucket each."""
+    assert _category_for_operation(operation) == category
+    gate = TelegramRateLimitGate()
+    assert category in gate.snapshot("+15551230001")["categories"]
+
+
+def test_exhausted_upload_budget_leaves_other_buckets_alone() -> None:
+    """A spent upload hour must not lock the account out: users.getUsers of the
+    connect path and every unclassified read RPC are priced in ``default``."""
+    clock = _Clock()
+    gate = TelegramRateLimitGate(
+        category_limits={
+            "upload": RateLimitSpec(
+                max_calls=2, window_sec=60, sustained_max_calls=4, sustained_window_sec=3600.0
+            )
+        },
+        time_func=clock,
+        jitter_func=_no_jitter,
+    )
+    for _ in range(2):
+        assert gate.try_acquire("+1", "upload") == 0.0
+        assert gate.try_acquire("+1", "upload") == 0.0
+        clock.now += 60.0
+    assert gate.try_acquire("+1", "upload") > 60.0  # the sustained hour is spent
+    assert gate.try_acquire("+1", "default") == 0.0
+    assert gate.try_acquire("+1", "download") == 0.0
+
+
+def test_transfer_budgets_do_not_inherit_the_resolve_sustained_cap() -> None:
+    """60 calls an hour is the username-resolve calibration. Priced that way,
+    two upload RPC per photo made the sixth file of an album fail on a
+    half-spent hour (tg_content_factory#1985)."""
+    spec = TelegramRateLimitGate.TRANSFER_SPEC
+    # The burst transfers always had; an hour that admits one maximum-size
+    # legal upload (8192 parts of 512 KB) with a margin.
+    assert (spec.max_calls, spec.window_sec) == (1000, 60.0)
+    assert (spec.sustained_max_calls, spec.sustained_window_sec) == (10_000, 3600.0)
+    clock = _Clock()
+    gate = TelegramRateLimitGate(time_func=clock, jitter_func=_no_jitter)
+    for category in ("upload", "download"):
+        for _ in range(30):  # sixty calls in half an hour
+            assert gate.try_acquire("+1", category) == 0.0
+            assert gate.try_acquire("+1", category) == 0.0
+            clock.now += spec.window_sec
+        assert gate.try_acquire("+1", category) == 0.0
+
+
+def test_category_spec_carries_its_own_sustained_budget() -> None:
+    """A category's sustained tier is a decision of its spec. ``None``/``None``
+    turns it off for that bucket; categories without the override keep the
+    limiter's default tier."""
+    clock = _Clock()
+    gate = TelegramRateLimitGate(
+        category_limits={
+            "history": RateLimitSpec(
+                max_calls=1, window_sec=60, sustained_max_calls=None, sustained_window_sec=None
+            )
+        },
+        time_func=clock,
+        jitter_func=_no_jitter,
+    )
+    for _ in range(70):  # one a minute for seventy minutes, no hour-long lockout
+        assert gate.try_acquire("+1", "history") == 0.0
+        clock.now += 60.0
+
+    plain_clock = _Clock()
+    plain = TelegramRateLimitGate(time_func=plain_clock, jitter_func=_no_jitter)
+    for _ in range(30):  # sixty sends in half an hour
+        assert plain.try_acquire("+1", "send") == 0.0
+        assert plain.try_acquire("+1", "send") == 0.0
+        plain_clock.now += 60.0
+    assert plain.try_acquire("+1", "send") > 60.0
+
+
+@pytest.mark.parametrize(
+    "sustained_kwargs",
+    ({"sustained_max_calls": None}, {"sustained_window_sec": None}),
+)
+def test_category_sustained_budget_comes_as_a_pair(sustained_kwargs: dict) -> None:
+    with pytest.raises(ValueError, match="together"):
+        TelegramRateLimitGate(category_limits={"history": RateLimitSpec(1, 60.0, **sustained_kwargs)})
+
+
 def test_phase_two_categories_are_separately_calibrated() -> None:
     gate = TelegramRateLimitGate()
     assert gate.category_for("telegram_stream_messages") == "history"
@@ -829,4 +921,33 @@ def test_peer_specs_validate_window_at_construction() -> None:
     with pytest.raises(ValueError, match="send:user"):
         TelegramRateLimitGate(
             peer_limits={"send:user": RateLimitSpec(max_calls=1, window_sec=0.0)}
+        )
+
+
+@pytest.mark.parametrize(
+    "sustained_kwargs",
+    ({"sustained_max_calls": None}, {"sustained_window_sec": None}),
+)
+def test_peer_specs_validate_sustained_pair_at_construction(sustained_kwargs: dict) -> None:
+    """A peer spec with a half-set sustained tier must fail at gate
+    construction: the peer bucket builds its limiter lazily at request time,
+    so the pair would otherwise surface the limiter's ValueError from inside
+    try_acquire on the first acquire for that peer."""
+    with pytest.raises(ValueError, match="together"):
+        TelegramRateLimitGate(
+            peer_limits={"send:user": RateLimitSpec(1, 1.1, **sustained_kwargs)}
+        )
+
+
+def test_peer_specs_validate_sustained_window_at_construction() -> None:
+    """A sustained window below the burst window must fail at gate
+    construction: ResolveRateLimiter rejects that ordering, and the peer
+    bucket's limiter is built inside try_acquire, which must never raise."""
+    with pytest.raises(ValueError, match="send:user"):
+        TelegramRateLimitGate(
+            peer_limits={
+                "send:user": RateLimitSpec(
+                    max_calls=1, window_sec=60.0, sustained_max_calls=10, sustained_window_sec=30.0
+                )
+            }
         )
