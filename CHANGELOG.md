@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.12 (2026-11-28)
+
 - Register the RPC dispatch boundary's dynamic tag for the forum-topics
   listing read (`rpc:GetForumTopicsRequest`, issue #40) in the calibrated
   `history` bucket. It fell through to the permissive `default` category
