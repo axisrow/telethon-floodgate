@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- `history` has no sustained hour (tg_content_factory#1991). Every bucket
+  inherits the limiter's sustained tier — 60 calls an hour, the
+  username-resolve calibration of #26 — and at the calibrated 24/30s pace
+  that is one minute of reads and 59 minutes of refusal per account: the
+  consumer's collector ran 246-248 fetches an hour for four accounts and
+  logged about 10,000 refusals an hour. The burst is the measured guard; the
+  two deep floods on record were username resolves. Set a sustained pair on
+  the category through `category_limits` to bring an hour back.
+
 ## 0.1.12 (2026-11-28)
 
 - Register the RPC dispatch boundary's dynamic tag for the forum-topics
